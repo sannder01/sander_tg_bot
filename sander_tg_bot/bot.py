@@ -1,0 +1,630 @@
+"""
+bot.py — Chronicle Engine v3.0
+================================
+Upgraded Telegram bot with:
+  · Advanced Task Manager (NLP, calendar, analytics, reminders)
+  · AITU LMS Deadline fetcher
+  · Groq AI chat + business auto-reply
+
+Run:
+  python bot.py
+"""
+
+import os
+import re
+import sys
+import json
+import logging
+import pytz
+from datetime import datetime, timedelta, timezone
+from urllib.request import urlopen, Request
+
+from groq import Groq
+from dotenv import load_dotenv
+from icalendar import Calendar
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import Conflict
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    TypeHandler,
+)
+
+# Chronicle modules
+import db
+from tasks import (
+    build_task_conversation,
+    build_task_callbacks,
+    daily_briefing_job,
+    reminder_check_job,
+)
+
+# ─── Bootstrap ────────────────────────────────────────────────────────────────
+load_dotenv()
+
+logging.basicConfig(
+    format="%(asctime)s  %(name)-20s  %(levelname)s  %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+# ─── Groq ─────────────────────────────────────────────────────────────────────
+GROQ_KEY   = os.getenv("GROQ_API_KEY")
+groq_client = Groq(api_key=GROQ_KEY) if GROQ_KEY else None
+
+AUTO_REPLY_SYSTEM_PROMPT = os.getenv(
+    "BOT_PERSONA",
+    "Ты отвечаешь вместо владельца этого Telegram аккаунта. "
+    "Отвечай вежливо, коротко и по делу. "
+    "Если не знаешь ответа — скажи что владелец скоро ответит лично. "
+    "Отвечай на языке собеседника.",
+)
+
+# ─── AITU Deadline config ────────────────────────────────────────────────────
+ICAL_URL = os.getenv(
+    "ICAL_URL",
+    "https://lms.astanait.edu.kz/calendar/export_execute.php"
+    "?userid=17634&authtoken=3f6f62339ece52c531c9dbffe568d0eacd33444f"
+    "&preset_what=courses&preset_time=recentupcoming",
+)
+DEADLINE_CHAT_ID = os.getenv("DEADLINE_CHAT_ID", "")
+DEADLINE_HOUR    = int(os.getenv("DEADLINE_HOUR",   "8"))
+DEADLINE_MINUTE  = int(os.getenv("DEADLINE_MINUTE", "0"))
+DEADLINE_TZ      = os.getenv("DEADLINE_TZ", "Asia/Almaty")
+DAYS_AHEAD       = int(os.getenv("DAYS_AHEAD", "7"))
+
+# ─── Simple JSON DB (AI history + business history only) ─────────────────────
+DB_FILE = "data.json"
+
+def load_db() -> dict:
+    if os.path.exists(DB_FILE):
+        with open(DB_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"ai_history": {}, "business_history": {}, "ai_enabled": {}}
+
+def save_db(d: dict):
+    with open(DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+
+def get_chat_key(update: Update) -> str:
+    return str(update.effective_chat.id)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  AITU LMS DEADLINES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _escape_md(text: str) -> str:
+    for ch in r"\_*[]()~`>#+-=|{}.!":
+        text = text.replace(ch, "\\" + ch)
+    return text
+
+
+def _parse_course(component) -> str:
+    cats = str(component.get("CATEGORIES", ""))
+    if cats and cats not in ("None", ""):
+        return cats.strip()
+    desc  = str(component.get("DESCRIPTION", ""))
+    match = re.search(r"Course[:\s]+(.+)", desc, re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    summ  = str(component.get("SUMMARY", ""))
+    match = re.search(r"\((.+?)\)\s*$", summ)
+    if match:
+        return match.group(1).strip()
+    return "Unknown"
+
+
+def fetch_deadlines() -> list:
+    req = Request(ICAL_URL, headers={
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        )
+    })
+    with urlopen(req, timeout=15) as resp:
+        raw = resp.read()
+
+    tz_obj = pytz.timezone(DEADLINE_TZ)
+    cal    = Calendar.from_ical(raw)
+    now    = datetime.now(tz_obj)
+    limit  = now + timedelta(days=DAYS_AHEAD)
+    events = []
+
+    for comp in cal.walk():
+        if comp.name != "VEVENT":
+            continue
+        dtstart = comp.get("DTSTART")
+        if dtstart is None:
+            continue
+        dt = dtstart.dt
+        if not isinstance(dt, datetime):
+            dt = datetime(dt.year, dt.month, dt.day, tzinfo=timezone.utc)
+        if dt.tzinfo is None:
+            dt = tz_obj.localize(dt)
+        else:
+            dt = dt.astimezone(tz_obj)
+        if now <= dt <= limit:
+            events.append({
+                "title":  str(comp.get("SUMMARY", "(no title)")),
+                "course": _parse_course(comp),
+                "dt":     dt,
+                "url":    str(comp.get("URL", "")),
+            })
+
+    events.sort(key=lambda e: e["dt"])
+    return events
+
+
+def _build_deadline_msg(events: list) -> str:
+    tz_obj  = pytz.timezone(DEADLINE_TZ)
+    now     = datetime.now(tz_obj)
+    now_str = _escape_md(now.strftime("%d.%m.%Y %H:%M"))
+
+    if not events:
+        return (
+            "✅ *No deadlines\\!*\n"
+            f"Nothing in the next {DAYS_AHEAD} days\\.\n"
+            f"_Updated: {now_str}_"
+        )
+
+    lines = [
+        f"📚 *AITU Deadlines — next {DAYS_AHEAD} days*",
+        f"_Updated: {now_str}_\n",
+    ]
+    for e in events:
+        delta = e["dt"] - now
+        days  = delta.days
+        hours = delta.seconds // 3600
+        if days == 0:
+            left = f"⚠️ today, in {hours}h"
+        elif days == 1:
+            left = "🔶 tomorrow"
+        elif days <= 3:
+            left = f"🟡 in {days} d\\."
+        else:
+            left = f"🟢 in {days} d\\."
+
+        date_str = _escape_md(e["dt"].strftime("%d.%m %H:%M"))
+        title    = _escape_md(e["title"])
+        course   = _escape_md(e["course"])
+        line     = f"{left} — *{title}*\n    📖 {course}\n    📅 {date_str}"
+        if e["url"] and e["url"] != "None":
+            line += f"\n    🔗 [Open]({e['url']})"
+        lines.append(line)
+
+    return "\n\n".join(lines)
+
+
+async def cmd_deadlines(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text("⏳ Loading deadlines…")
+    try:
+        events = fetch_deadlines()
+        await msg.edit_text(
+            _build_deadline_msg(events),
+            parse_mode="MarkdownV2",
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.error("Deadline fetch error: %s", e)
+        await msg.edit_text(
+            f"❌ Failed to load deadlines:\n<code>{e}</code>",
+            parse_mode="HTML",
+        )
+
+
+async def daily_deadlines_job(context: ContextTypes.DEFAULT_TYPE):
+    if not DEADLINE_CHAT_ID:
+        return
+    try:
+        events = fetch_deadlines()
+        await context.bot.send_message(
+            chat_id   = DEADLINE_CHAT_ID,
+            text      = _build_deadline_msg(events),
+            parse_mode="MarkdownV2",
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.error("daily_deadlines_job error: %s", e)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  BUSINESS AUTO-REPLY
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.business_message or update.message
+    if not message or not message.text:
+        return
+    if message.from_user and message.from_user.is_bot:
+        return
+
+    chat_id     = str(message.chat.id)
+    user_text   = message.text.strip()
+    sender_name = (message.from_user.first_name or "User") if message.from_user else "User"
+
+    # ── Command detection ──
+    if user_text.startswith("/"):
+        cmd  = user_text.split()[0].lstrip("/").split("@")[0].lower()
+        args = user_text.split()[1:]
+        user_msg = " ".join(args)
+        reply = ""
+
+        if cmd == "ai":
+            if not groq_client:
+                reply = "⚠️ No GROQ_API_KEY configured."
+            elif not user_msg:
+                reply = "✏️ /ai <your question>"
+            else:
+                try:
+                    resp  = groq_client.chat.completions.create(
+                        model="llama-3.3-70b-versatile",
+                        messages=[
+                            {"role": "system", "content": "Ты дружелюбный ассистент. Отвечай коротко с юмором. Отвечай на языке пользователя."},
+                            {"role": "user",   "content": user_msg},
+                        ],
+                        max_tokens=500,
+                    )
+                    reply = "🤖 " + resp.choices[0].message.content
+                except Exception:
+                    reply = "❌ AI unavailable. Try later."
+
+        elif cmd == "stop":
+            d = load_db()
+            d.setdefault("ai_enabled", {})[chat_id] = False
+            save_db(d)
+            reply = "🔇 AI auto-reply disabled.\nSend /resume to re-enable."
+
+        elif cmd == "resume":
+            d = load_db()
+            d.setdefault("ai_enabled", {})[chat_id] = True
+            save_db(d)
+            reply = "🔊 AI auto-reply enabled!"
+
+        elif cmd == "help":
+            reply = (
+                "📋 <b>Commands:</b>\n\n"
+                "/deadlines — AITU LMS deadlines\n"
+                "/ai &lt;question&gt; — ask AI\n"
+                "/stop — disable AI auto-reply\n"
+                "/resume — enable AI auto-reply"
+            )
+        else:
+            reply = "❓ Unknown command. Try /help"
+
+        try:
+            await context.bot.send_message(
+                chat_id=message.chat.id,
+                text=reply,
+                parse_mode="HTML",
+                business_connection_id=message.business_connection_id,
+            )
+        except Exception as e:
+            logger.error("Business command reply error: %s", e)
+        return
+
+    # ── Auto-reply ──
+    d = load_db()
+    if not d.get("ai_enabled", {}).get(chat_id):
+        return
+
+    d.setdefault("business_history", {}).setdefault(chat_id, [])
+    hist = d["business_history"][chat_id]
+    hist.append({"role": "user", "content": f"{sender_name}: {user_text}"})
+    if len(hist) > 10:
+        hist = hist[-10:]
+
+    try:
+        resp  = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "system", "content": AUTO_REPLY_SYSTEM_PROMPT}, *hist],
+            max_tokens=300,
+        )
+        reply = resp.choices[0].message.content
+        hist.append({"role": "assistant", "content": reply})
+        d["business_history"][chat_id] = hist
+        save_db(d)
+        await context.bot.send_message(
+            chat_id=message.chat.id,
+            text=reply,
+            business_connection_id=message.business_connection_id,
+        )
+    except Exception as e:
+        logger.error("Business auto-reply error: %s", e)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CORE COMMANDS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ai_status = "✅ Groq (Llama 3)" if groq_client else "❌ No GROQ_API_KEY"
+    await update.message.reply_text(
+        "⚡️ <b>CHRONICLE ENGINE</b>  <code>v3.0</code>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"  🤖  AI Engine:  {ai_status}\n\n"
+        "  <b>Modules:</b>\n"
+        "  🔹  /tasks      — <i>Task Manager</i>\n"
+        "         ↳ NLP add · Calendar · Analytics\n"
+        "         ↳ Reminders · Archive\n"
+        "  🔹  /deadlines  — <i>AITU LMS Deadlines</i>\n"
+        "  🔹  /ai         — <i>AI Assistant</i>\n"
+        "  🔹  /tz         — <i>Set your timezone</i>\n"
+        "  🔹  /briefing   — <i>Toggle morning briefing</i>\n"
+        "  🔹  /persona    — <i>Set AI auto-reply style</i>\n"
+        "  🔹  /status     — <i>System status</i>\n"
+        "  🔹  /reset      — <i>Reset AI history</i>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "  Start with /tasks to manage your day.",
+        parse_mode="HTML",
+    )
+
+
+async def cmd_set_tz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set user timezone: /tz Asia/Almaty"""
+    if not context.args:
+        uid = str(update.effective_user.id)
+        current = db.get_tz(uid)
+        return await update.message.reply_text(
+            f"🕐 Your timezone: <code>{current}</code>\n\n"
+            "To change:\n<code>/tz Asia/Almaty</code>\n<code>/tz Europe/Moscow</code>\n<code>/tz UTC</code>",
+            parse_mode="HTML",
+        )
+    tz_name = context.args[0]
+    try:
+        pytz.timezone(tz_name)  # Validate
+    except pytz.exceptions.UnknownTimeZoneError:
+        return await update.message.reply_text(
+            f"❌ Unknown timezone: <code>{tz_name}</code>\n"
+            "See: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones",
+            parse_mode="HTML",
+        )
+    uid = str(update.effective_user.id)
+    db.update_settings(uid, timezone=tz_name)
+    now_local = datetime.now(pytz.timezone(tz_name)).strftime("%H:%M %Z")
+    await update.message.reply_text(
+        f"✅ Timezone set to <code>{tz_name}</code>\n"
+        f"Current time: <code>{now_local}</code>",
+        parse_mode="HTML",
+    )
+
+
+async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle or configure morning briefing: /briefing on|off [hour]"""
+    uid  = str(update.effective_user.id)
+    args = context.args
+
+    if not args:
+        s = db.get_settings(uid)
+        status = "✅ ON" if s["briefing_enabled"] else "❌ OFF"
+        return await update.message.reply_text(
+            f"☀️ <b>Morning Briefing</b>: {status}\n"
+            f"Time: <code>{s['briefing_hour']:02d}:00 {s['timezone']}</code>\n\n"
+            "Toggle: <code>/briefing on</code> | <code>/briefing off</code>\n"
+            "Set hour: <code>/briefing on 8</code>",
+            parse_mode="HTML",
+        )
+
+    cmd  = args[0].lower()
+    hour = int(args[1]) if len(args) > 1 and args[1].isdigit() else None
+    if cmd == "on":
+        kwargs: dict = {"briefing_enabled": 1}
+        if hour is not None:
+            kwargs["briefing_hour"] = hour
+        db.update_settings(uid, **kwargs)
+        s    = db.get_settings(uid)
+        await update.message.reply_text(
+            f"✅ Morning briefing <b>enabled</b> at <code>{s['briefing_hour']:02d}:00 {s['timezone']}</code>",
+            parse_mode="HTML",
+        )
+    elif cmd == "off":
+        db.update_settings(uid, briefing_enabled=0)
+        await update.message.reply_text("❌ Morning briefing <b>disabled</b>.", parse_mode="HTML")
+    else:
+        await update.message.reply_text("Usage: /briefing on|off [hour]")
+
+
+async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not groq_client:
+        return await update.message.reply_text("⚠️ No GROQ_API_KEY in .env")
+    if not context.args:
+        return await update.message.reply_text("✏️ /ai how do I bake bread?")
+
+    key   = get_chat_key(update)
+    d     = load_db()
+    d.setdefault("ai_history", {}).setdefault(key, [])
+    msg   = " ".join(context.args)
+    hist  = d["ai_history"][key]
+    hist.append({"role": "user", "content": msg})
+    if len(hist) > 20:
+        hist = hist[-20:]
+
+    thinking = await update.message.reply_text("🤖 Thinking…")
+    try:
+        resp = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": "Ты дружелюбный ассистент. Отвечай коротко с юмором. Отвечай на языке пользователя."},
+                *hist,
+            ],
+            max_tokens=800,
+        )
+        reply = resp.choices[0].message.content
+        hist.append({"role": "assistant", "content": reply})
+        d["ai_history"][key] = hist
+        save_db(d)
+        await thinking.delete()
+        await update.message.reply_text("🤖 " + reply)
+    except Exception as e:
+        logger.error("Groq error: %s", e)
+        await thinking.edit_text("❌ AI unavailable. Try later.")
+
+
+async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    key = get_chat_key(update)
+    d   = load_db()
+    d.setdefault("ai_history", {})[key] = []
+    save_db(d)
+    await update.message.reply_text("🔄 AI history cleared.")
+
+
+async def cmd_persona(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global AUTO_REPLY_SYSTEM_PROMPT
+    if not context.args:
+        return await update.message.reply_text(
+            "✏️ Usage:\n/persona Reply briefly, I'm busy\n/persona Say I'll reply soon"
+        )
+    AUTO_REPLY_SYSTEM_PROMPT = " ".join(context.args)
+    await update.message.reply_text(
+        f"✅ Persona updated:\n\n<i>{AUTO_REPLY_SYSTEM_PROMPT}</i>", parse_mode="HTML"
+    )
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ai = "✅ Connected" if groq_client else "❌ Not configured"
+    uid = str(update.effective_user.id)
+    s   = db.get_settings(uid)
+    task_count = len(db.get_tasks(uid))
+    await update.message.reply_text(
+        "⚡️ <b>SYSTEM STATUS</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"  🤖  AI:       {ai}\n"
+        f"  🕐  Timezone: <code>{s['timezone']}</code>\n"
+        f"  ☀️  Briefing: {'✅' if s['briefing_enabled'] else '❌'}  "
+        f"<code>{s['briefing_hour']:02d}:00</code>\n"
+        f"  📝  Tasks:    <code>{task_count} active</code>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━",
+        parse_mode="HTML",
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ERROR HANDLER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Handle errors gracefully — suppress Conflict spam, log the rest."""
+    if isinstance(context.error, Conflict):
+        logger.warning(
+            "Conflict error: another bot instance is still running. "
+            "Will retry automatically…"
+        )
+        return
+    logger.error("Unhandled exception:", exc_info=context.error)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  LOCK FILE (prevent duplicate instances)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+LOCK_FILE = "bot.lock"
+
+def _acquire_lock():
+    """Write PID to lock file. Exit if another instance is already running."""
+    if os.path.exists(LOCK_FILE):
+        with open(LOCK_FILE) as f:
+            old_pid = f.read().strip()
+        # Check if the process is actually still alive
+        try:
+            os.kill(int(old_pid), 0)
+            logger.error(
+                "Another bot instance is running (PID %s). "
+                "Stop it first or delete '%s'.",
+                old_pid, LOCK_FILE,
+            )
+            sys.exit(1)
+        except (ProcessLookupError, ValueError):
+            # Stale lock — previous process is gone
+            logger.warning("Stale lock file found (PID %s). Overwriting.", old_pid)
+
+    with open(LOCK_FILE, "w") as f:
+        f.write(str(os.getpid()))
+
+
+def _release_lock():
+    try:
+        os.remove(LOCK_FILE)
+    except FileNotFoundError:
+        pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        raise ValueError("TELEGRAM_BOT_TOKEN not set in .env!")
+
+    _acquire_lock()
+
+    # Initialize SQLite DB + migrate old JSON tasks
+    db.init_db()
+    db.migrate_from_json()
+
+    app = Application.builder().token(token).build()
+
+    # Make groq_client available to task handlers
+    app.bot_data["groq_client"] = groq_client
+
+    # ── Error handler ─────────────────────────────────────────────────────────
+    app.add_error_handler(error_handler)
+
+    # ── Business auto-reply (highest priority, group=-1) ──────────────────────
+    app.add_handler(TypeHandler(Update, handle_business_message), group=-1)
+
+    # ── Task Manager (ConversationHandler + standalone callbacks) ─────────────
+    app.add_handler(build_task_conversation())
+    for cb in build_task_callbacks():
+        app.add_handler(cb)
+
+    # ── Bot commands ──────────────────────────────────────────────────────────
+    app.add_handler(CommandHandler("start",     cmd_start))
+    app.add_handler(CommandHandler("help",      cmd_start))
+    app.add_handler(CommandHandler("deadlines", cmd_deadlines))
+    app.add_handler(CommandHandler("ai",        cmd_ai))
+    app.add_handler(CommandHandler("reset",     cmd_reset))
+    app.add_handler(CommandHandler("persona",   cmd_persona))
+    app.add_handler(CommandHandler("status",    cmd_status))
+    app.add_handler(CommandHandler("tz",        cmd_set_tz))
+    app.add_handler(CommandHandler("briefing",  cmd_briefing))
+
+    # ── Scheduled jobs ────────────────────────────────────────────────────────
+    jq = app.job_queue
+
+    # Deadline reminders: run every 60 seconds
+    jq.run_repeating(reminder_check_job, interval=60, first=10)
+    logger.info("Reminder check job: every 60s")
+
+    # AITU LMS daily deadlines
+    if DEADLINE_CHAT_ID:
+        tz_obj    = pytz.timezone(DEADLINE_TZ)
+        send_time = datetime.now(tz_obj).replace(
+            hour=DEADLINE_HOUR, minute=DEADLINE_MINUTE, second=0, microsecond=0
+        ).timetz()
+        jq.run_daily(daily_deadlines_job, time=send_time)
+        logger.info(
+            "AITU deadline broadcast: %02d:%02d %s → %s",
+            DEADLINE_HOUR, DEADLINE_MINUTE, DEADLINE_TZ, DEADLINE_CHAT_ID,
+        )
+
+    # Morning briefing: 09:00 UTC (each user's local time is handled inside the job)
+    briefing_time = datetime.now(pytz.utc).replace(
+        hour=1, minute=0, second=0, microsecond=0  # 01:00 UTC ≈ 06:00 Almaty
+    ).timetz()
+    jq.run_daily(daily_briefing_job, time=briefing_time)
+    logger.info("Morning briefing job registered")
+
+    logger.info("Chronicle Engine v3.0 started 🚀")
+    try:
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
+    finally:
+        _release_lock()
+
+
+if __name__ == "__main__":
+    main()
