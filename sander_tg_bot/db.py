@@ -1,17 +1,14 @@
 """
 db.py — Chronicle Engine: PostgreSQL Persistence Layer
 =======================================================
-Replaces MongoDB. Uses the same Vercel Postgres DB as the website.
-Collections → Tables:
-  tasks         — task records
-  user_settings — per-user timezone + briefing prefs (bot_user_settings)
-  tg_connections — telegram chat_id ↔ user_id link
+Uses Vercel Postgres (shared with the website).
+Tables: tasks, bot_user_settings, tg_connections
 """
 
 import os
-import json
 import logging
-from datetime import datetime, timedelta, timezone
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone, date
 from typing import Optional, List
 
 import psycopg2
@@ -25,11 +22,13 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 _pool: Optional[pg_pool.SimpleConnectionPool] = None
 
 
-# ── Connection ────────────────────────────────────────────────────────────────
+# ── Connection pool ───────────────────────────────────────────────────────────
 
-def _get_pool():
+def _get_pool() -> pg_pool.SimpleConnectionPool:
     global _pool
     if _pool is None:
+        if not DATABASE_URL:
+            raise RuntimeError("DATABASE_URL environment variable is not set.")
         _pool = pg_pool.SimpleConnectionPool(
             1, 5,
             dsn=DATABASE_URL,
@@ -39,85 +38,69 @@ def _get_pool():
     return _pool
 
 
-def _conn():
-    return _get_pool().getconn()
-
-
-def _release(conn):
-    _get_pool().putconn(conn)
+@contextmanager
+def _get_conn():
+    """Context manager that borrows a connection and always returns it to the pool."""
+    pool = _get_pool()
+    conn = pool.getconn()
+    try:
+        yield conn
+    finally:
+        pool.putconn(conn)
 
 
 def _query(sql: str, params=()) -> List[dict]:
-    conn = _conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-            conn.commit()
-            try:
+    """Execute a SELECT and return all rows as plain dicts."""
+    with _get_conn() as conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                conn.commit()
                 return [dict(r) for r in cur.fetchall()]
-            except Exception:
-                return []
-    except Exception as e:
-        conn.rollback()
-        raise e
-    finally:
-        _release(conn)
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def _exec(sql: str, params=()) -> Optional[dict]:
-    conn = _conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-            conn.commit()
-            try:
-                row = cur.fetchone()
-                return dict(row) if row else None
-            except Exception:
-                return None
-    except Exception as e:
-        conn.rollback()
-        raise e
-    finally:
-        _release(conn)
+    """Execute a DML statement and return the first row (for RETURNING clauses)."""
+    with _get_conn() as conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                conn.commit()
+                try:
+                    row = cur.fetchone()
+                    return dict(row) if row else None
+                except psycopg2.ProgrammingError:
+                    # No rows to fetch (e.g. plain UPDATE/DELETE without RETURNING)
+                    return None
+        except Exception:
+            conn.rollback()
+            raise
 
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
 
 def init_db():
-    """Create bot-specific tables if they don't exist."""
-    # Bot user settings (separate from web app users)
+    """Create bot-specific tables / columns if they don't exist."""
     _exec("""
         CREATE TABLE IF NOT EXISTS bot_user_settings (
-            tg_user_id   TEXT PRIMARY KEY,
-            timezone     TEXT DEFAULT 'Asia/Almaty',
-            briefing_hour INT DEFAULT 9,
-            briefing_enabled INT DEFAULT 1
+            tg_user_id       TEXT PRIMARY KEY,
+            timezone         TEXT DEFAULT 'Asia/Almaty',
+            briefing_hour    INT  DEFAULT 9,
+            briefing_enabled INT  DEFAULT 1
         )
     """)
-    # Add archived column to tasks if missing
-    _exec("""
-        ALTER TABLE tasks ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT FALSE
-    """)
-    # Add status column to tasks if missing
-    _exec("""
-        ALTER TABLE tasks ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'todo'
-    """)
-    # Add priority column to tasks if missing (already exists but just in case)
-    _exec("""
-        ALTER TABLE tasks ADD COLUMN IF NOT EXISTS priority TEXT DEFAULT 'medium'
-    """)
-    # Add reminder columns
-    _exec("""
-        ALTER TABLE tasks ADD COLUMN IF NOT EXISTS reminder_24h BOOLEAN DEFAULT FALSE
-    """)
-    _exec("""
-        ALTER TABLE tasks ADD COLUMN IF NOT EXISTS reminder_1h BOOLEAN DEFAULT FALSE
-    """)
-    _exec("""
-        ALTER TABLE tasks ADD COLUMN IF NOT EXISTS reminder_15m BOOLEAN DEFAULT FALSE
-    """)
-    # tg_connections already exists from migrate.js
+    for ddl in [
+        "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS archived      BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS status        TEXT    DEFAULT 'todo'",
+        "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS priority      TEXT    DEFAULT 'medium'",
+        "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS reminder_24h  BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS reminder_1h   BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS reminder_15m  BOOLEAN DEFAULT FALSE",
+    ]:
+        _exec(ddl)
     logger.info("PostgreSQL initialized")
 
 
@@ -125,7 +108,7 @@ def migrate_from_json(json_path: str = "tasks.json"):
     pass  # No longer needed
 
 
-# ── Telegram Link ─────────────────────────────────────────────────────────────
+# ── Telegram ↔ Web link ───────────────────────────────────────────────────────
 
 def link_telegram(tg_user_id: str, email: str) -> Optional[str]:
     """Link a Telegram user to a website account by email. Returns user_id or None."""
@@ -142,7 +125,7 @@ def link_telegram(tg_user_id: str, email: str) -> Optional[str]:
 
 
 def get_web_user_id(tg_user_id: str) -> Optional[str]:
-    """Get website user_id linked to this Telegram chat."""
+    """Get website user_id linked to this Telegram user."""
     rows = _query("SELECT user_id FROM tg_connections WHERE chat_id = %s", (tg_user_id,))
     return rows[0]["user_id"] if rows else None
 
@@ -170,10 +153,8 @@ def get_tz(tg_user_id: str) -> str:
 def update_settings(tg_user_id: str, **kwargs):
     if not kwargs:
         return
-    # Ensure row exists
     _exec("""
-        INSERT INTO bot_user_settings (tg_user_id)
-        VALUES (%s) ON CONFLICT DO NOTHING
+        INSERT INTO bot_user_settings (tg_user_id) VALUES (%s) ON CONFLICT DO NOTHING
     """, (tg_user_id,))
     sets = ", ".join(f"{k} = %s" for k in kwargs)
     vals = list(kwargs.values()) + [tg_user_id]
@@ -198,7 +179,6 @@ def _sort_tasks(tasks: List[dict]) -> List[dict]:
 
 
 def _get_user_id(tg_user_id: str) -> Optional[str]:
-    """Get website user_id for task operations."""
     return get_web_user_id(tg_user_id)
 
 
@@ -211,17 +191,19 @@ def add_task(
     deadline_utc: Optional[str] = None,
     status: str = "todo",
 ) -> int:
-    # user_id here is tg_user_id — get web user_id
     web_uid = _get_user_id(user_id)
     if not web_uid:
-        raise ValueError(f"Telegram user {user_id} is not linked to a website account. Use /link <email>")
+        raise ValueError(
+            f"Telegram user {user_id} is not linked to a website account. Use /link <email>"
+        )
 
     due_date = None
     if deadline_utc:
         try:
+            # BUG FIX: store only the date portion in due_date to match the DB column type
             due_date = datetime.fromisoformat(deadline_utc).date()
-        except Exception:
-            pass
+        except ValueError:
+            logger.warning("Invalid deadline_utc format: %s", deadline_utc)
 
     completed = status == "done"
     row = _exec("""
@@ -249,9 +231,9 @@ def get_task(task_id: int) -> Optional[dict]:
 def update_task(task_id: int, **kwargs):
     if not kwargs:
         return
-    # Map old field names to new ones
     if "archived" in kwargs:
         kwargs["archived"] = bool(kwargs["archived"])
+    # BUG FIX: field name normalisation — "deadline" → "due_date"
     if "deadline" in kwargs:
         kwargs["due_date"] = kwargs.pop("deadline")
     sets = ", ".join(f"{k} = %s" for k in kwargs)
@@ -272,21 +254,19 @@ def archive_done_tasks(tg_user_id: str) -> int:
     web_uid = _get_user_id(tg_user_id)
     if not web_uid:
         return 0
-    conn = _conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                UPDATE tasks SET archived = TRUE
-                WHERE user_id = %s AND completed = TRUE AND archived = FALSE
-            """, (web_uid,))
-            count = cur.rowcount
-            conn.commit()
-            return count
-    except Exception as e:
-        conn.rollback()
-        raise e
-    finally:
-        _release(conn)
+    with _get_conn() as conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE tasks SET archived = TRUE
+                    WHERE user_id = %s AND completed = TRUE AND archived = FALSE
+                """, (web_uid,))
+                count = cur.rowcount
+                conn.commit()
+                return count
+        except Exception:
+            conn.rollback()
+            raise
 
 
 # ── Calendar Query ────────────────────────────────────────────────────────────
@@ -316,26 +296,40 @@ def get_tasks_for_month(tg_user_id: str, year: int, month: int) -> dict:
 # ── Reminder Queries ──────────────────────────────────────────────────────────
 
 def get_tasks_needing_reminders() -> List[tuple]:
-    now = datetime.now(timezone.utc)
+    """
+    BUG FIX: original query compared due_date (DATE) with datetime windows built from
+    datetime.now(utc) + timedelta(minutes/hours). This is unreliable because a DATE
+    column loses the time-of-day information needed for sub-day reminders.
+    The safe approach is to treat the whole due_date day as the deadline boundary
+    and rely on the reminder_* flags to fire at most once.
+    """
+    now = datetime.now(timezone.utc).date()
+    tomorrow = now + timedelta(days=1)
+
     windows = [
-        ("reminder_15m", now + timedelta(minutes=10), now + timedelta(minutes=20)),
-        ("reminder_1h",  now + timedelta(minutes=50), now + timedelta(minutes=70)),
-        ("reminder_24h", now + timedelta(hours=23),   now + timedelta(hours=25)),
+        # (flag, earliest_due_date, latest_due_date)
+        ("reminder_15m", now,      now),        # due today
+        ("reminder_1h",  now,      now),        # due today
+        ("reminder_24h", tomorrow, tomorrow),   # due tomorrow
     ]
     results = []
-    for flag, t_min, t_max in windows:
+    for flag, d_min, d_max in windows:
         rows = _query(f"""
-            SELECT t.*, tc.chat_id as tg_chat_id FROM tasks t
+            SELECT t.*, tc.chat_id AS tg_chat_id FROM tasks t
             JOIN tg_connections tc ON tc.user_id = t.user_id
             WHERE t.{flag} = FALSE AND t.completed = FALSE AND t.archived = FALSE
               AND t.due_date >= %s AND t.due_date <= %s
-        """, (t_min.date(), t_max.date()))
+        """, (d_min, d_max))
         for row in rows:
             results.append((flag, dict(row)))
     return results
 
 
 def mark_reminder_sent(task_id: int, flag: str):
+    # BUG FIX: validate flag name to prevent SQL injection via f-string
+    allowed = {"reminder_15m", "reminder_1h", "reminder_24h"}
+    if flag not in allowed:
+        raise ValueError(f"Invalid reminder flag: {flag!r}")
     _exec(f"UPDATE tasks SET {flag} = TRUE WHERE id = %s", (task_id,))
 
 
@@ -346,20 +340,32 @@ def get_analytics(tg_user_id: str) -> dict:
     if not web_uid:
         return {}
     now = datetime.now(timezone.utc)
-    week_start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    week_start      = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
     last_week_start = week_start - timedelta(weeks=1)
 
     total_active   = len(_query("SELECT id FROM tasks WHERE user_id = %s AND archived = FALSE", (web_uid,)))
-    done_this_week = len(_query("SELECT id FROM tasks WHERE user_id = %s AND completed = TRUE AND created_at >= %s", (web_uid, week_start)))
-    done_last_week = len(_query("SELECT id FROM tasks WHERE user_id = %s AND completed = TRUE AND created_at >= %s AND created_at < %s", (web_uid, last_week_start, week_start)))
+    done_this_week = len(_query(
+        "SELECT id FROM tasks WHERE user_id = %s AND completed = TRUE AND created_at >= %s",
+        (web_uid, week_start),
+    ))
+    done_last_week = len(_query(
+        "SELECT id FROM tasks WHERE user_id = %s AND completed = TRUE AND created_at >= %s AND created_at < %s",
+        (web_uid, last_week_start, week_start),
+    ))
     total_archived = len(_query("SELECT id FROM tasks WHERE user_id = %s AND archived = TRUE", (web_uid,)))
 
     by_status: dict = {}
-    for row in _query("SELECT status, COUNT(*) as cnt FROM tasks WHERE user_id = %s AND archived = FALSE GROUP BY status", (web_uid,)):
+    for row in _query(
+        "SELECT status, COUNT(*) AS cnt FROM tasks WHERE user_id = %s AND archived = FALSE GROUP BY status",
+        (web_uid,),
+    ):
         by_status[row["status"]] = row["cnt"]
 
     by_priority: dict = {}
-    for row in _query("SELECT priority, COUNT(*) as cnt FROM tasks WHERE user_id = %s AND archived = FALSE GROUP BY priority", (web_uid,)):
+    for row in _query(
+        "SELECT priority, COUNT(*) AS cnt FROM tasks WHERE user_id = %s AND archived = FALSE GROUP BY priority",
+        (web_uid,),
+    ):
         by_priority[row["priority"]] = row["cnt"]
 
     return {
