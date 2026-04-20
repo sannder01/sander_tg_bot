@@ -19,7 +19,7 @@ FSM States (ConversationHandler):
 
 import calendar as cal_mod
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from typing import Optional
 
 import pytz
@@ -53,10 +53,28 @@ WAIT_TEXT, WAIT_PRIORITY = range(2)
 PAGE_SIZE  = 5
 DIVIDER    = "━━━━━━━━━━━━━━━━━━━━"
 
-STATUS_ICON  = {"todo": "🔲", "in_progress": "🔄", "done": "✅"}
-STATUS_LABEL = {"todo": "To Do", "in_progress": "In Progress", "done": "Done"}
+STATUS_ICON    = {"todo": "🔲", "in_progress": "🔄", "done": "✅"}
+STATUS_LABEL   = {"todo": "To Do", "in_progress": "In Progress", "done": "Done"}
 PRIORITY_ICON  = {"high": "🔴", "medium": "🟡", "low": "🟢"}
 PRIORITY_LABEL = {"high": "HIGH", "medium": "MEDIUM", "low": "LOW"}
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _task_text(t: dict) -> str:
+    """Return the display text for a task, normalising title/text field names."""
+    return t.get("title") or t.get("text", "")
+
+
+def _task_deadline(t: dict) -> Optional[str]:
+    """Return the deadline/due_date as a string, normalising field names."""
+    # Tasks stored in DB have due_date (DATE); older in-memory tasks may have "deadline" (ISO str)
+    raw = t.get("deadline") or t.get("due_date")
+    if raw is None:
+        return None
+    if isinstance(raw, date):
+        return raw.isoformat()
+    return str(raw)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -64,19 +82,20 @@ PRIORITY_LABEL = {"high": "HIGH", "medium": "MEDIUM", "low": "LOW"}
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _task_line(t: dict, idx: int, user_tz: str) -> str:
-    si   = STATUS_ICON.get(t["status"], "🔲")
-    pi   = PRIORITY_ICON.get(t["priority"], "🟡")
-    title = t["text"]
-    if t["status"] == "done":
+    si    = STATUS_ICON.get(t.get("status", "todo"), "🔲")
+    pi    = PRIORITY_ICON.get(t.get("priority", "medium"), "🟡")
+    title = _task_text(t)
+    if t.get("status") == "done":
         title = f"<s>{title}</s>"
     else:
         title = f"<b>{title}</b>"
 
     line = f"  {pi} {si}  {idx}. {title}"
 
-    if t.get("deadline"):
-        dl_str = format_deadline_local(t["deadline"], user_tz)
-        eta    = time_until(t["deadline"])
+    dl = _task_deadline(t)
+    if dl:
+        dl_str = format_deadline_local(dl, user_tz)
+        eta    = time_until(dl)
         line += f"\n        📅 <code>{dl_str}</code>  <i>({eta})</i>"
 
     return line
@@ -88,7 +107,7 @@ def _build_list_text(tasks: list, page: int, user_tz: str) -> str:
     end   = min(start + PAGE_SIZE, total)
     total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
 
-    counts = {s: sum(1 for t in tasks if t["status"] == s) for s in STATUS_ICON}
+    counts = {s: sum(1 for t in tasks if t.get("status") == s) for s in STATUS_ICON}
 
     header = (
         "⚡️ <b>PROJECT: CHRONICLE</b>\n"
@@ -119,11 +138,10 @@ def _build_list_keyboard(tasks: list, page: int) -> InlineKeyboardMarkup:
     total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
     rows = []
 
-    # Per-task "view" buttons
     task_row = []
     for i in range(start, end):
-        t = tasks[i]
-        icon = STATUS_ICON.get(t["status"], "🔲")
+        t    = tasks[i]
+        icon = STATUS_ICON.get(t.get("status", "todo"), "🔲")
         task_row.append(
             InlineKeyboardButton(f"{icon} {i + 1}", callback_data=f"tm_vw_{t['id']}")
         )
@@ -133,7 +151,6 @@ def _build_list_keyboard(tasks: list, page: int) -> InlineKeyboardMarkup:
     if task_row:
         rows.append(task_row)
 
-    # Nav row
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton("◀️", callback_data=f"tm_pg_{page - 1}"))
@@ -142,7 +159,6 @@ def _build_list_keyboard(tasks: list, page: int) -> InlineKeyboardMarkup:
     if nav:
         rows.append(nav)
 
-    # Actions
     rows.append([
         InlineKeyboardButton("➕ Add Task", callback_data="task_add"),
         InlineKeyboardButton("📅 Calendar", callback_data="tm_cal_now"),
@@ -159,33 +175,36 @@ def _build_list_keyboard(tasks: list, page: int) -> InlineKeyboardMarkup:
 
 
 def _build_detail_text(t: dict, user_tz: str) -> str:
-    si = STATUS_ICON[t["status"]]
-    pi = PRIORITY_ICON[t["priority"]]
-    sl = STATUS_LABEL[t["status"]]
-    pl = PRIORITY_LABEL[t["priority"]]
+    status   = t.get("status", "todo")
+    priority = t.get("priority", "medium")
+    si = STATUS_ICON.get(status, "🔲")
+    pi = PRIORITY_ICON.get(priority, "🟡")
+    sl = STATUS_LABEL.get(status, status)
+    pl = PRIORITY_LABEL.get(priority, priority)
 
     lines = [
         f"⚡️ <b>TASK #{t['id']}</b>",
         DIVIDER,
-        f"  📌 <b>{t['text']}</b>",
+        f"  📌 <b>{_task_text(t)}</b>",
         "",
         f"  {pi}  Priority: <b>{pl}</b>",
         f"  {si}  Status:   <b>{sl}</b>",
     ]
 
-    if t.get("deadline"):
-        dl_str = format_deadline_local(t["deadline"], user_tz)
-        eta    = time_until(t["deadline"])
+    dl = _task_deadline(t)
+    if dl:
+        dl_str = format_deadline_local(dl, user_tz)
+        eta    = time_until(dl)
         lines += [
             f"  📅  Deadline: <code>{dl_str}</code>",
             f"  ⏱  Remaining: <i>{eta}</i>",
         ]
 
-    created = t.get("created_at", "")[:16].replace("T", " ")
+    created = str(t.get("created_at", ""))[:16].replace("T", " ")
     lines.append(f"\n  🕓  Created: <code>{created} UTC</code>")
 
     if t.get("completed_at"):
-        done_at = t["completed_at"][:16].replace("T", " ")
+        done_at = str(t["completed_at"])[:16].replace("T", " ")
         lines.append(f"  ✅  Completed: <code>{done_at} UTC</code>")
 
     lines.append(f"\n{DIVIDER}")
@@ -193,13 +212,11 @@ def _build_detail_text(t: dict, user_tz: str) -> str:
 
 
 def _build_detail_keyboard(task_id: int, current_status: str, current_priority: str) -> InlineKeyboardMarkup:
-    # Status row — highlight current
     status_row = []
     for s, icon in STATUS_ICON.items():
         label = f"·{icon}·" if s == current_status else icon
         status_row.append(InlineKeyboardButton(label, callback_data=f"tm_st_{task_id}_{s[0]}"))
 
-    # Priority row
     priority_row = []
     for p, icon in PRIORITY_ICON.items():
         label = f"·{icon}·" if p == current_priority else icon
@@ -233,23 +250,22 @@ def _build_calendar_text(year: int, month: int) -> str:
 def _build_calendar_keyboard(user_id: str, year: int, month: int) -> InlineKeyboardMarkup:
     day_tasks = db.get_tasks_for_month(user_id, year, month)
     today = datetime.utcnow()
+    rows  = []
 
-    rows = []
-    # Weekday header
     rows.append([
         InlineKeyboardButton(d, callback_data="tm_noop")
         for d in ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
     ])
 
     _, num_days = cal_mod.monthrange(year, month)
-    first_wd   = cal_mod.monthrange(year, month)[0]  # 0=Mon
+    first_wd   = cal_mod.monthrange(year, month)[0]
     week_row   = [InlineKeyboardButton(" ", callback_data="tm_noop")] * first_wd
 
     for day in range(1, num_days + 1):
         tasks_today = day_tasks.get(day, [])
         if tasks_today:
-            statuses   = {t["status"] for t in tasks_today}
-            priorities = {t["priority"] for t in tasks_today}
+            statuses   = {t.get("status") for t in tasks_today}
+            priorities = {t.get("priority") for t in tasks_today}
             if statuses == {"done"}:
                 emoji = "✅"
             elif "high" in priorities:
@@ -275,13 +291,12 @@ def _build_calendar_keyboard(user_id: str, year: int, month: int) -> InlineKeybo
         week_row += [InlineKeyboardButton(" ", callback_data="tm_noop")] * pad
         rows.append(week_row)
 
-    # Navigation
-    prev_year, prev_month = (year, month - 1) if month > 1 else (year - 1, 12)
-    next_year, next_month = (year, month + 1) if month < 12 else (year + 1, 1)
+    prev_year,  prev_month = (year, month - 1) if month > 1 else (year - 1, 12)
+    next_year,  next_month = (year, month + 1) if month < 12 else (year + 1, 1)
     rows.append([
-        InlineKeyboardButton(f"◀️", callback_data=f"tm_cal_{prev_year}_{prev_month}"),
+        InlineKeyboardButton("◀️",                   callback_data=f"tm_cal_{prev_year}_{prev_month}"),
         InlineKeyboardButton(f"🗓 {year}-{month:02d}", callback_data="tm_noop"),
-        InlineKeyboardButton(f"▶️", callback_data=f"tm_cal_{next_year}_{next_month}"),
+        InlineKeyboardButton("▶️",                   callback_data=f"tm_cal_{next_year}_{next_month}"),
     ])
     rows.append([InlineKeyboardButton("↩️ Back to List", callback_data="tm_pg_0")])
     return InlineKeyboardMarkup(rows)
@@ -293,19 +308,17 @@ def _build_day_text(date_str: str, tasks: list, user_tz: str) -> str:
     day   = int(date_str[6:8])
     date_label = datetime(year, month, day).strftime("%d %B %Y")
 
-    header = (
-        f"📅 <b>{date_label}</b>\n"
-        f"{DIVIDER}\n"
-    )
+    header = f"📅 <b>{date_label}</b>\n{DIVIDER}\n"
     if not tasks:
         return header + "  <i>No tasks with deadlines on this day.</i>\n" + DIVIDER
 
     lines = [header]
     for t in tasks:
-        si   = STATUS_ICON.get(t["status"], "🔲")
-        pi   = PRIORITY_ICON.get(t["priority"], "🟡")
-        dl   = format_deadline_local(t["deadline"], user_tz) if t.get("deadline") else ""
-        lines.append(f"  {pi} {si} <b>{t['text']}</b>\n      <code>{dl}</code>")
+        si = STATUS_ICON.get(t.get("status", "todo"), "🔲")
+        pi = PRIORITY_ICON.get(t.get("priority", "medium"), "🟡")
+        dl = _task_deadline(t)
+        dl_str = format_deadline_local(dl, user_tz) if dl else ""
+        lines.append(f"  {pi} {si} <b>{_task_text(t)}</b>\n      <code>{dl_str}</code>")
 
     lines.append(DIVIDER)
     return "\n".join(lines)
@@ -315,8 +328,8 @@ def _build_day_keyboard(date_str: str, tasks: list) -> InlineKeyboardMarkup:
     rows = []
     for t in tasks:
         rows.append([InlineKeyboardButton(
-            f"{STATUS_ICON.get(t['status'],'🔲')} {t['text'][:28]}",
-            callback_data=f"tm_vw_{t['id']}"
+            f"{STATUS_ICON.get(t.get('status', 'todo'), '🔲')} {_task_text(t)[:28]}",
+            callback_data=f"tm_vw_{t['id']}",
         )])
     year  = int(date_str[:4])
     month = int(date_str[4:6])
@@ -327,19 +340,17 @@ def _build_day_keyboard(date_str: str, tasks: list) -> InlineKeyboardMarkup:
 # ── Analytics ─────────────────────────────────────────────────────────────────
 
 def _build_analytics_text(stats: dict) -> str:
-    tw = stats["done_this_week"]
-    lw = stats["done_last_week"]
+    tw    = stats.get("done_this_week", 0)
+    lw    = stats.get("done_last_week", 0)
     delta = tw - lw
     trend = f"🔼 +{delta}" if delta > 0 else (f"🔽 {delta}" if delta < 0 else "➡️ same")
 
-    bs = stats["by_status"]
-    bp = stats["by_priority"]
+    bs = stats.get("by_status", {})
+    bp = stats.get("by_priority", {})
 
-    total_active = stats["total_active"]
-    rate = 0
-    if total_active:
-        done_active = bs.get("done", 0)
-        rate = round(done_active / total_active * 100)
+    total_active = stats.get("total_active", 0)
+    done_active  = bs.get("done", 0)
+    rate = round(done_active / total_active * 100) if total_active else 0
 
     return (
         f"📊 <b>PRODUCTIVITY REPORT</b>\n"
@@ -359,8 +370,8 @@ def _build_analytics_text(stats: dict) -> str:
         f"  🟡 Medium: <code>{bp.get('medium', 0)}</code>\n"
         f"  🟢 Low:    <code>{bp.get('low', 0)}</code>\n\n"
         f"{DIVIDER}\n"
-        f"  📦 Archived: <code>{stats['total_archived']}</code>  "
-        f"  🗂 All-time:  <code>{stats['total_ever']}</code>\n"
+        f"  📦 Archived: <code>{stats.get('total_archived', 0)}</code>  "
+        f"  🗂 All-time:  <code>{stats.get('total_ever', 0)}</code>\n"
         f"{DIVIDER}"
     )
 
@@ -373,28 +384,25 @@ def _build_archive_text(tasks: list, page: int) -> str:
     end   = min(start + PAGE_SIZE, total)
     total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
 
-    header = (
-        f"📦 <b>ARCHIVE</b>  ({total} tasks)\n"
-        f"{DIVIDER}\n"
-    )
+    header = f"📦 <b>ARCHIVE</b>  ({total} tasks)\n{DIVIDER}\n"
     if not tasks:
         return header + "  <i>Archive is empty.</i>\n" + DIVIDER
 
     lines = []
     for t in tasks[start:end]:
-        pi = PRIORITY_ICON.get(t["priority"], "🟡")
-        completed = (t.get("completed_at") or "")[:10]
-        lines.append(f"  {pi} ✅ <s>{t['text']}</s>  <code>{completed}</code>")
+        pi        = PRIORITY_ICON.get(t.get("priority", "medium"), "🟡")
+        completed = str(t.get("completed_at") or "")[:10]
+        lines.append(f"  {pi} ✅ <s>{_task_text(t)}</s>  <code>{completed}</code>")
 
     footer = f"\n{DIVIDER}\n📄 Page <code>{page + 1}/{total_pages}</code>"
     return header + "\n".join(lines) + footer
 
 
 def _build_archive_keyboard(tasks: list, page: int) -> InlineKeyboardMarkup:
-    total = len(tasks)
+    total       = len(tasks)
     total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
     rows = []
-    nav = []
+    nav  = []
     if page > 0:
         nav.append(InlineKeyboardButton("◀️", callback_data=f"tm_arc_{page - 1}"))
     if page < total_pages - 1:
@@ -447,13 +455,16 @@ async def cb_noop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def cb_view_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
+    query   = update.callback_query
     await query.answer()
     uid     = str(query.from_user.id)
     task_id = int(query.data.split("_")[-1])
     task    = db.get_task(task_id)
 
-    if not task or task["user_id"] != uid:
+    # BUG FIX: task["user_id"] is a web user_id (UUID/int), not a Telegram user id.
+    # We must compare against the linked web_user_id, not the raw Telegram uid.
+    web_uid = db.get_web_user_id(uid)
+    if not task or str(task.get("user_id")) != str(web_uid):
         await query.answer("⚠️ Task not found.", show_alert=True)
         return
 
@@ -461,7 +472,7 @@ async def cb_view_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(
         _build_detail_text(task, tz),
         parse_mode="HTML",
-        reply_markup=_build_detail_keyboard(task_id, task["status"], task["priority"]),
+        reply_markup=_build_detail_keyboard(task_id, task.get("status", "todo"), task.get("priority", "medium")),
     )
 
 
@@ -474,14 +485,14 @@ async def cb_set_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_map = {"t": "todo", "i": "in_progress", "d": "done"}
     status  = status_map.get(s_key, "todo")
 
-    task = db.get_task(task_id)
-    if not task or task["user_id"] != uid:
+    web_uid = db.get_web_user_id(uid)
+    task    = db.get_task(task_id)
+    if not task or str(task.get("user_id")) != str(web_uid):
         await query.answer("⚠️ Task not found.", show_alert=True)
         return
 
     db.set_status(task_id, status)
-    task = db.get_task(task_id)  # reload
-
+    task  = db.get_task(task_id)
     label = STATUS_LABEL.get(status, status)
     await query.answer(f"{STATUS_ICON.get(status, '')} → {label}")
 
@@ -489,21 +500,22 @@ async def cb_set_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(
         _build_detail_text(task, tz),
         parse_mode="HTML",
-        reply_markup=_build_detail_keyboard(task_id, task["status"], task["priority"]),
+        reply_markup=_build_detail_keyboard(task_id, task.get("status", "todo"), task.get("priority", "medium")),
     )
 
 
 async def cb_set_priority(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query   = update.callback_query
-    uid     = str(query.from_user.id)
-    parts   = query.data.split("_")   # tm_pr_{id}_{p}
-    task_id = int(parts[2])
-    p_key   = parts[3]
+    query    = update.callback_query
+    uid      = str(query.from_user.id)
+    parts    = query.data.split("_")   # tm_pr_{id}_{p}
+    task_id  = int(parts[2])
+    p_key    = parts[3]
     priority_map = {"h": "high", "m": "medium", "l": "low"}
     priority = priority_map.get(p_key, "medium")
 
-    task = db.get_task(task_id)
-    if not task or task["user_id"] != uid:
+    web_uid = db.get_web_user_id(uid)
+    task    = db.get_task(task_id)
+    if not task or str(task.get("user_id")) != str(web_uid):
         await query.answer("⚠️ Task not found.", show_alert=True)
         return
 
@@ -515,7 +527,7 @@ async def cb_set_priority(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(
         _build_detail_text(task, tz),
         parse_mode="HTML",
-        reply_markup=_build_detail_keyboard(task_id, task["status"], task["priority"]),
+        reply_markup=_build_detail_keyboard(task_id, task.get("status", "todo"), task.get("priority", "medium")),
     )
 
 
@@ -523,13 +535,14 @@ async def cb_delete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
     uid     = str(query.from_user.id)
     task_id = int(query.data.split("_")[-1])
-    task    = db.get_task(task_id)
 
-    if not task or task["user_id"] != uid:
+    web_uid = db.get_web_user_id(uid)
+    task    = db.get_task(task_id)
+    if not task or str(task.get("user_id")) != str(web_uid):
         await query.answer("⚠️ Task not found.", show_alert=True)
         return
 
-    title = task["text"][:25]
+    title = _task_text(task)[:25]
     db.delete_task(task_id)
     await query.answer(f"🗑 «{title}» deleted.")
 
@@ -546,13 +559,14 @@ async def cb_archive_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
     uid     = str(query.from_user.id)
     task_id = int(query.data.split("_")[-1])
-    task    = db.get_task(task_id)
 
-    if not task or task["user_id"] != uid:
+    web_uid = db.get_web_user_id(uid)
+    task    = db.get_task(task_id)
+    if not task or str(task.get("user_id")) != str(web_uid):
         await query.answer("⚠️ Task not found.", show_alert=True)
         return
 
-    db.update_task(task_id, archived=1)
+    db.update_task(task_id, archived=True)
     await query.answer("📦 Archived.")
 
     tz    = db.get_tz(uid)
@@ -587,14 +601,14 @@ async def cb_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     uid  = str(query.from_user.id)
-    data = query.data  # tm_cal_now  OR  tm_cal_{year}_{month}
+    data = query.data   # tm_cal_now  OR  tm_cal_{year}_{month}
 
     if data == "tm_cal_now":
         now = datetime.utcnow()
         year, month = now.year, now.month
     else:
-        _, _, y, m = data.split("_")
-        year, month = int(y), int(m)
+        parts = data.split("_")   # ["tm", "cal", year, month]
+        year, month = int(parts[2]), int(parts[3])
 
     await query.edit_message_text(
         _build_calendar_text(year, month),
@@ -693,18 +707,18 @@ async def fsm_receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Please type something. Try again:")
         return WAIT_TEXT
 
-    uid       = str(update.effective_user.id)
-    tz_str    = db.get_tz(uid)
-    groq_cli  = context.bot_data.get("groq_client")
+    uid      = str(update.effective_user.id)
+    tz_str   = db.get_tz(uid)
+    groq_cli = context.bot_data.get("groq_client")
 
     parsed = parse_task_message(text, tz_str, groq_cli)
     context.user_data["parsed_task"] = parsed
 
-    # Build preview
+    dl = parsed.get("deadline")
     dl_display = (
-        f"\n  📅  Deadline: <code>{format_deadline_local(parsed['deadline'], tz_str)}</code>"
-        f"  <i>({time_until(parsed['deadline'])})</i>"
-        if parsed.get("deadline") else "\n  📅  Deadline: <i>none</i>"
+        f"\n  📅  Deadline: <code>{format_deadline_local(dl, tz_str)}</code>"
+        f"  <i>({time_until(dl)})</i>"
+        if dl else "\n  📅  Deadline: <i>none</i>"
     )
     pi = PRIORITY_ICON.get(parsed["priority"], "🟡")
     pl = PRIORITY_LABEL.get(parsed["priority"], "MEDIUM")
@@ -734,7 +748,7 @@ async def fsm_select_priority(update: Update, context: ContextTypes.DEFAULT_TYPE
     """FSM: user picked a priority → save task."""
     query    = update.callback_query
     uid      = str(query.from_user.id)
-    p_key    = query.data.split("_")[-1]   # h / m / l
+    p_key    = query.data.split("_")[-1]
     pmap     = {"h": "high", "m": "medium", "l": "low"}
     priority = pmap.get(p_key, "medium")
 
@@ -744,13 +758,19 @@ async def fsm_select_priority(update: Update, context: ContextTypes.DEFAULT_TYPE
         return ConversationHandler.END
 
     parsed["priority"] = priority
-    task_id = db.add_task(
-        user_id      = uid,
-        text         = parsed["title"],
-        priority     = priority,
-        deadline_utc = parsed.get("deadline"),
-    )
-    await query.answer(f"✅ Task #{task_id} created!", show_alert=False)
+
+    try:
+        task_id = db.add_task(
+            user_id      = uid,
+            text         = parsed["title"],
+            priority     = priority,
+            deadline_utc = parsed.get("deadline"),
+        )
+        await query.answer(f"✅ Task #{task_id} created!", show_alert=False)
+    except ValueError as e:
+        # User is not linked — tell them how to fix it
+        await query.answer(str(e), show_alert=True)
+        return ConversationHandler.END
 
     tz    = db.get_tz(uid)
     tasks = db.get_tasks(uid)
@@ -780,7 +800,7 @@ async def fsm_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  REMINDER JOB (runs every 60 s via bot job_queue)
+#  REMINDER JOB
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _REMIND_LABELS = {
@@ -796,26 +816,30 @@ async def reminder_check_job(context: ContextTypes.DEFAULT_TYPE):
     for flag, task in pending:
         try:
             emoji, label = _REMIND_LABELS.get(flag, ("⏰", "soon"))
-            pi    = PRIORITY_ICON.get(task["priority"], "🟡")
-            title = task["text"][:50]
+            pi    = PRIORITY_ICON.get(task.get("priority", "medium"), "🟡")
+            title = _task_text(task)[:50]
+            dl    = _task_deadline(task) or ""
             msg   = (
                 f"{emoji} <b>DEADLINE REMINDER</b>\n"
                 f"{DIVIDER}\n\n"
                 f"  {pi} <b>{title}</b>\n\n"
                 f"  ⏱ Due in <b>{label}</b>!\n"
-                f"  📅 <code>{task.get('deadline','')[:16].replace('T',' ')} UTC</code>\n\n"
+                f"  📅 <code>{dl[:10]}</code>\n\n"
                 f"{DIVIDER}\n"
                 f"  Tap /tasks to manage it."
             )
+            # BUG FIX: use tg_chat_id (Telegram user id) instead of task["user_id"]
+            # (which is the website's UUID).
+            chat_id = task.get("tg_chat_id") or task.get("user_id")
             await context.bot.send_message(
-                chat_id   = task["user_id"],
-                text      = msg,
-                parse_mode="HTML",
+                chat_id    = chat_id,
+                text       = msg,
+                parse_mode = "HTML",
             )
             db.mark_reminder_sent(task["id"], flag)
-            logger.info("Reminder [%s] sent for task %d to user %s", flag, task["id"], task["user_id"])
+            logger.info("Reminder [%s] sent for task %d to %s", flag, task["id"], chat_id)
         except Exception as e:
-            logger.error("Failed to send reminder for task %d: %s", task["id"], e)
+            logger.error("Failed to send reminder for task %d: %s", task.get("id"), e)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -823,12 +847,7 @@ async def reminder_check_job(context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def daily_briefing_job(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Send each user their morning task briefing.
-    Iterates over all users who have briefing enabled.
-    Called from bot.py via job_queue.run_daily().
-    """
-    # Get all Telegram users with briefing enabled from PostgreSQL
+    """Send each user their morning task briefing."""
     users = db._query(
         "SELECT tg_user_id, timezone FROM bot_user_settings WHERE briefing_enabled = 1"
     )
@@ -839,30 +858,27 @@ async def daily_briefing_job(context: ContextTypes.DEFAULT_TYPE):
             tz  = pytz.timezone(tz_str)
             now = datetime.now(tz)
 
-            tasks      = db.get_tasks(uid)
-            active     = [t for t in tasks if t.get("status") != "done" and not t.get("completed")]
-            today_tasks = []
-            overdue     = []
+            tasks  = db.get_tasks(uid)
+            active = [t for t in tasks if t.get("status") != "done" and not t.get("completed")]
+
+            today_tasks: list = []
+            overdue:     list = []
 
             for t in active:
-                due = t.get("due_date")
-                if not due:
+                raw_due = t.get("due_date")
+                if not raw_due:
                     continue
                 try:
-                    if hasattr(due, "date"):
-                        due_date = due
-                    else:
-                        from datetime import date
-                        due_date = date.fromisoformat(str(due))
+                    due_date = raw_due if isinstance(raw_due, date) else date.fromisoformat(str(raw_due))
                     if due_date == now.date():
                         today_tasks.append(t)
                     elif due_date < now.date():
                         overdue.append(t)
-                except Exception:
+                except (ValueError, TypeError):
                     pass
 
             if not active and not today_tasks and not overdue:
-                continue  # Nothing to report
+                continue
 
             lines = [
                 f"☀️ <b>MORNING BRIEFING — {now.strftime('%d %B')}</b>",
@@ -872,27 +888,32 @@ async def daily_briefing_job(context: ContextTypes.DEFAULT_TYPE):
             if overdue:
                 lines.append(f"\n⚠️ <b>OVERDUE ({len(overdue)}):</b>")
                 for t in overdue[:5]:
-                    pi = PRIORITY_ICON.get(t["priority"], "🟡")
-                    lines.append(f"  {pi} <s>{(t.get('title') or t.get('text', ''))[:40]}</s>")
+                    pi = PRIORITY_ICON.get(t.get("priority", "medium"), "🟡")
+                    lines.append(f"  {pi} <s>{_task_text(t)[:40]}</s>")
 
             if today_tasks:
                 lines.append(f"\n📅 <b>DUE TODAY ({len(today_tasks)}):</b>")
                 for t in today_tasks:
-                    pi  = PRIORITY_ICON.get(t["priority"], "🟡")
-                    si  = STATUS_ICON.get(t["status"], "🔲")
+                    pi      = PRIORITY_ICON.get(t.get("priority", "medium"), "🟡")
+                    si      = STATUS_ICON.get(t.get("status", "todo"), "🔲")
                     due_str = str(t.get("due_date", ""))
-                    lines.append(f"  {pi} {si} <b>{(t.get('title') or t.get('text', ''))[:35]}</b>  <code>{due_str[-5:]}</code>")
+                    lines.append(
+                        f"  {pi} {si} <b>{_task_text(t)[:35]}</b>  <code>{due_str[-5:]}</code>"
+                    )
 
             lines.append(f"\n🔲 <b>Active tasks:</b> <code>{len(active)}</code>")
             lines.append(DIVIDER)
             lines.append("  Tap /tasks to manage your day.")
 
             await context.bot.send_message(
-                chat_id   = uid,
-                text      = "\n".join(lines),
-                parse_mode="HTML",
+                chat_id    = uid,
+                text       = "\n".join(lines),
+                parse_mode = "HTML",
             )
-            logger.info("Daily briefing sent to %s (%d today, %d overdue)", uid, len(today_tasks), len(overdue))
+            logger.info(
+                "Daily briefing sent to %s (%d today, %d overdue)",
+                uid, len(today_tasks), len(overdue),
+            )
 
         except Exception as e:
             logger.error("Briefing failed for user %s: %s", uid, e)
@@ -903,19 +924,6 @@ async def daily_briefing_job(context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def build_task_conversation() -> ConversationHandler:
-    """
-    State machine for adding a new task.
-
-    /tasks or ➕ button
-        │
-        ▼
-     WAIT_TEXT ──── user types description ──►  WAIT_PRIORITY
-        │                                             │
-     ❌ Cancel                            priority btn / ❌ Cancel
-        │                                             │
-        ▼                                             ▼
-      END (list)                               task saved → END (list)
-    """
     return ConversationHandler(
         entry_points=[
             CommandHandler("tasks", cmd_tasks),
@@ -941,7 +949,6 @@ def build_task_conversation() -> ConversationHandler:
 
 
 def build_task_callbacks() -> list:
-    """All standalone CallbackQueryHandlers (registered outside ConversationHandler)."""
     return [
         # Navigation
         CallbackQueryHandler(cb_page,         pattern=r"^tm_pg_\d+$"),
