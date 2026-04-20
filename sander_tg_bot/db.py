@@ -17,8 +17,8 @@ from psycopg2 import pool as pg_pool
 
 logger = logging.getLogger(__name__)
 
-DATABASE_URL = os.getenv("DATABASE_URL", "")
-
+# DATABASE_URL is read lazily inside _get_pool() so load_dotenv() in bot.py
+# has already populated os.environ before we connect.
 _pool: Optional[pg_pool.SimpleConnectionPool] = None
 
 
@@ -27,11 +27,16 @@ _pool: Optional[pg_pool.SimpleConnectionPool] = None
 def _get_pool() -> pg_pool.SimpleConnectionPool:
     global _pool
     if _pool is None:
-        if not DATABASE_URL:
-            raise RuntimeError("DATABASE_URL environment variable is not set.")
+        # Re-read at call time so the value set by load_dotenv() in bot.py is visible.
+        dsn = os.getenv("DATABASE_URL", "")
+        if not dsn:
+            raise RuntimeError(
+                "DATABASE_URL is not set. "
+                "Add it to your .env file or Railway/Vercel environment variables."
+            )
         _pool = pg_pool.SimpleConnectionPool(
             1, 5,
-            dsn=DATABASE_URL,
+            dsn=dsn,
             sslmode="require",
             cursor_factory=psycopg2.extras.RealDictCursor,
         )
