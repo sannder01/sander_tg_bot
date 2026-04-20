@@ -8,6 +8,7 @@ Collections:
 """
 
 import os
+import certifi
 import json
 import logging
 from datetime import datetime, timedelta, timezone
@@ -27,7 +28,7 @@ _client: Optional[MongoClient] = None
 def _db():
     global _client
     if _client is None:
-        _client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+        _client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000, tlsCAFile=certifi.where())
     return _client["chronicle"]
 
 
