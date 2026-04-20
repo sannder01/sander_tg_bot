@@ -628,7 +628,6 @@ def _acquire_lock():
     if os.path.exists(LOCK_FILE):
         with open(LOCK_FILE) as f:
             old_pid = f.read().strip()
-        # Check if the process is actually still alive
         try:
             os.kill(int(old_pid), 0)
             logger.error(
@@ -637,13 +636,15 @@ def _acquire_lock():
                 old_pid, LOCK_FILE,
             )
             sys.exit(1)
+        except PermissionError:
+            # PID существует, но это не наш процесс (PID 1 / init в контейнере)
+            logger.warning("Stale lock file (PID %s is not the bot). Overwriting.", old_pid)
         except (ProcessLookupError, ValueError):
             # Stale lock — previous process is gone
             logger.warning("Stale lock file found (PID %s). Overwriting.", old_pid)
 
     with open(LOCK_FILE, "w") as f:
         f.write(str(os.getpid()))
-
 
 def _release_lock():
     try:
