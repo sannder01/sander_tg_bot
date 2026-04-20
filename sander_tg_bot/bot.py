@@ -82,52 +82,50 @@ DEADLINE_TZ      = os.getenv("DEADLINE_TZ", "Asia/Almaty")
 DAYS_AHEAD       = int(os.getenv("DAYS_AHEAD", "7"))
 
 # ─── MongoDB helpers for bot-level data (history, settings, ical) ────────────
+#простые dict-хранилища
 
-def _bot_col():
-    """Reuse the same MongoDB client from db.py."""
-    import db as _db_module
-    return _db_module._col("bot_data")
+_ai_history: dict = {}
+_biz_history: dict = {}
+_ai_enabled: dict = {}
+_ical_urls: dict = {}
 
-def _get_doc(key: str) -> dict:
-    doc = _bot_col().find_one({"_id": key})
-    return doc.get("value", {}) if doc else {}
-
-def _set_doc(key: str, value: dict):
-    _bot_col().replace_one({"_id": key}, {"_id": key, "value": value}, upsert=True)
 
 # ── Convenience wrappers that mirror the old load_db/save_db interface ────────
 
 def _get_ai_history(key: str) -> list:
-    return _get_doc(f"ai_history:{key}").get("msgs", [])
+    return _ai_history.get(key, [])
 
 def _set_ai_history(key: str, msgs: list):
-    _set_doc(f"ai_history:{key}", {"msgs": msgs})
+    _ai_history[key] = msgs
 
 def _get_biz_history(chat_id: str) -> list:
-    return _get_doc(f"biz_history:{chat_id}").get("msgs", [])
+    return _biz_history.get(chat_id, [])
 
 def _set_biz_history(chat_id: str, msgs: list):
-    _set_doc(f"biz_history:{chat_id}", {"msgs": msgs})
+    _biz_history[chat_id] = msgs
 
 def _get_ai_enabled(chat_id: str) -> bool:
-    return bool(_get_doc(f"ai_enabled:{chat_id}").get("enabled", False))
+    return _ai_enabled.get(chat_id, False)
 
 def _set_ai_enabled(chat_id: str, value: bool):
-    _set_doc(f"ai_enabled:{chat_id}", {"enabled": value})
+    _ai_enabled[chat_id] = value
 
 def _get_ical_url(user_id: str) -> str:
-    return _get_doc(f"ical_url:{user_id}").get("url", "")
+    return _ical_urls.get(user_id, ICAL_URL)
 
 def _set_ical_url(user_id: str, url: str):
-    _set_doc(f"ical_url:{user_id}", {"url": url})
+    _ical_urls[user_id] = url
 
-def get_chat_key(update: Update) -> str:
-    return str(update.effective_chat.id)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  AITU LMS DEADLINES
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def get_chat_key(update: Update) -> str:
+    if update.effective_chat:
+        return f"chat_{update.effective_chat.id}"
+    return f"user_{update.effective_user.id}"
 
 def _escape_md(text: str) -> str:
     for ch in r"\_*[]()~`>#+-=|{}.!":
@@ -601,6 +599,45 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML",
     )
 
+async def cmd_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Link Telegram account to Chronicle website account."""
+    uid = str(update.effective_user.id)
+    args = context.args
+
+    if not args:
+        await update.message.reply_text(
+            "📧 *Привяжи аккаунт сайта к боту*\n\n"
+            "Используй команду:\n`/link твой@email.com`\n\n"
+            "Email должен совпадать с тем, через который ты входишь на сайт через Google.",
+            parse_mode="Markdown"
+        )
+        return
+
+    email = args[0].strip().lower()
+
+    # Check if already linked
+    existing = db.get_web_user_id(uid)
+    if existing:
+        await update.message.reply_text(
+            "✅ Аккаунт уже привязан! Задачи синхронизируются с сайтом.\n\n"
+            f"Чтобы сменить аккаунт, напиши `/link новый@email.com`",
+            parse_mode="Markdown"
+        )
+
+    user_id = db.link_telegram(uid, email)
+    if user_id:
+        await update.message.reply_text(
+            f"✅ *Аккаунт привязан!*\n\n"
+            f"Теперь все задачи из бота появятся на сайте [schronicle.vercel.app](https://schronicle.vercel.app) и наоборот.",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(
+            f"❌ Email `{email}` не найден на сайте.\n\n"
+            f"Убедись что ты зарегистрирован на [schronicle.vercel.app](https://schronicle.vercel.app) через Google с этим email.",
+            parse_mode="Markdown"
+        )
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ERROR HANDLER
@@ -675,6 +712,7 @@ def main():
 
     # ── Error handler ─────────────────────────────────────────────────────────
     app.add_error_handler(error_handler)
+    app.add_handler(CommandHandler("link", cmd_link))
 
     # ── Business auto-reply (highest priority, group=-1) ──────────────────────
     app.add_handler(TypeHandler(Update, handle_business_message), group=-1)
