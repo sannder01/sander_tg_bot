@@ -828,32 +828,35 @@ async def daily_briefing_job(context: ContextTypes.DEFAULT_TYPE):
     Iterates over all users who have briefing enabled.
     Called from bot.py via job_queue.run_daily().
     """
-    import sqlite3
-    with db._conn() as con:
-        users = con.execute(
-            "SELECT user_id, timezone FROM user_settings WHERE briefing_enabled=1"
-        ).fetchall()
+    # Get all Telegram users with briefing enabled from PostgreSQL
+    users = db._query(
+        "SELECT tg_user_id, timezone FROM bot_user_settings WHERE briefing_enabled = 1"
+    )
 
     for row in users:
-        uid, tz_str = row["user_id"], row["timezone"]
+        uid, tz_str = row["tg_user_id"], row["timezone"]
         try:
             tz  = pytz.timezone(tz_str)
             now = datetime.now(tz)
 
             tasks      = db.get_tasks(uid)
-            active     = [t for t in tasks if t["status"] != "done"]
+            active     = [t for t in tasks if t.get("status") != "done" and not t.get("completed")]
             today_tasks = []
             overdue     = []
 
             for t in active:
-                if not t.get("deadline"):
+                due = t.get("due_date")
+                if not due:
                     continue
                 try:
-                    dt_utc  = datetime.fromisoformat(t["deadline"]).replace(tzinfo=pytz.utc)
-                    dt_local = dt_utc.astimezone(tz)
-                    if dt_local.date() == now.date():
+                    if hasattr(due, "date"):
+                        due_date = due
+                    else:
+                        from datetime import date
+                        due_date = date.fromisoformat(str(due))
+                    if due_date == now.date():
                         today_tasks.append(t)
-                    elif dt_local < now:
+                    elif due_date < now.date():
                         overdue.append(t)
                 except Exception:
                     pass
@@ -870,15 +873,15 @@ async def daily_briefing_job(context: ContextTypes.DEFAULT_TYPE):
                 lines.append(f"\n⚠️ <b>OVERDUE ({len(overdue)}):</b>")
                 for t in overdue[:5]:
                     pi = PRIORITY_ICON.get(t["priority"], "🟡")
-                    lines.append(f"  {pi} <s>{t['text'][:40]}</s>")
+                    lines.append(f"  {pi} <s>{(t.get('title') or t.get('text', ''))[:40]}</s>")
 
             if today_tasks:
                 lines.append(f"\n📅 <b>DUE TODAY ({len(today_tasks)}):</b>")
                 for t in today_tasks:
                     pi  = PRIORITY_ICON.get(t["priority"], "🟡")
                     si  = STATUS_ICON.get(t["status"], "🔲")
-                    dl  = format_deadline_local(t["deadline"], tz_str)
-                    lines.append(f"  {pi} {si} <b>{t['text'][:35]}</b>  <code>{dl[-5:]}</code>")
+                    due_str = str(t.get("due_date", ""))
+                    lines.append(f"  {pi} {si} <b>{(t.get('title') or t.get('text', ''))[:35]}</b>  <code>{due_str[-5:]}</code>")
 
             lines.append(f"\n🔲 <b>Active tasks:</b> <code>{len(active)}</code>")
             lines.append(DIVIDER)
