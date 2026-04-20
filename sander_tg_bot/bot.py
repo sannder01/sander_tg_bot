@@ -82,7 +82,7 @@ DEADLINE_TZ      = os.getenv("DEADLINE_TZ", "Asia/Almaty")
 DAYS_AHEAD       = int(os.getenv("DAYS_AHEAD", "7"))
 
 # ─── Simple JSON DB (AI history + business history only) ─────────────────────
-DB_FILE = "data.json"
+DB_FILE = os.path.join(os.getenv("DATA_DIR", "."), "data.json")
 
 def load_db() -> dict:
     if os.path.exists(DB_FILE):
