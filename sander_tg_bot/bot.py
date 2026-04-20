@@ -330,6 +330,9 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
         return
     if message.from_user and message.from_user.is_bot:
         return
+    # Обрабатываем только реальные бизнес-сообщения
+    if not update.business_message and not getattr(message, "business_connection_id", None):
+        return
 
     chat_id     = str(message.chat.id)
     user_text   = message.text.strip()
