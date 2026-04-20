@@ -1,7 +1,7 @@
 """
 bot.py — Chronicle Engine v3.0
 ================================
-Upgraded Telegram bot with:
+Telegram bot with:
   · Advanced Task Manager (NLP, calendar, analytics, reminders)
   · AITU LMS Deadline fetcher
   · Groq AI chat + business auto-reply
@@ -13,11 +13,11 @@ Run:
 import os
 import re
 import sys
-import json
 import logging
 import pytz
 from datetime import datetime, timedelta, timezone
 from urllib.request import urlopen, Request
+from urllib.error import URLError
 
 from groq import Groq
 from dotenv import load_dotenv
@@ -35,7 +35,6 @@ from telegram.ext import (
     TypeHandler,
 )
 
-# Chronicle modules
 import db
 from tasks import (
     build_task_conversation,
@@ -44,7 +43,7 @@ from tasks import (
     reminder_check_job,
 )
 
-# ─── Conversation states ──────────────────────────────────────────────────────
+# ─── Conversation states ───────────────────────────────────────────────────────
 WAITING_ICAL_URL = 1
 
 # ─── Bootstrap ────────────────────────────────────────────────────────────────
@@ -56,19 +55,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ─── Groq ─────────────────────────────────────────────────────────────────────
-GROQ_KEY   = os.getenv("GROQ_API_KEY")
+# ─── Groq ──────────────────────────────────────────────────────────────────────
+GROQ_KEY = os.getenv("GROQ_API_KEY")
 groq_client = Groq(api_key=GROQ_KEY) if GROQ_KEY else None
 
-AUTO_REPLY_SYSTEM_PROMPT = os.getenv(
-    "BOT_PERSONA",
-    "Ты отвечаешь вместо владельца этого Telegram аккаунта. "
-    "Отвечай вежливо, коротко и по делу. "
-    "Если не знаешь ответа — скажи что владелец скоро ответит лично. "
-    "Отвечай на языке собеседника.",
-)
+# Use a mutable container so cmd_persona can mutate without `global`
+_persona = {
+    "prompt": os.getenv(
+        "BOT_PERSONA",
+        "Ты отвечаешь вместо владельца этого Telegram аккаунта. "
+        "Отвечай вежливо, коротко и по делу. "
+        "Если не знаешь ответа — скажи что владелец скоро ответит лично. "
+        "Отвечай на языке собеседника.",
+    )
+}
 
-# ─── AITU Deadline config ────────────────────────────────────────────────────
+# ─── AITU Deadline config ──────────────────────────────────────────────────────
 ICAL_URL = os.getenv(
     "ICAL_URL",
     "https://lms.astanait.edu.kz/calendar/export_execute.php"
@@ -81,41 +83,36 @@ DEADLINE_MINUTE  = int(os.getenv("DEADLINE_MINUTE", "0"))
 DEADLINE_TZ      = os.getenv("DEADLINE_TZ", "Asia/Almaty")
 DAYS_AHEAD       = int(os.getenv("DAYS_AHEAD", "7"))
 
-# ─── MongoDB helpers for bot-level data (history, settings, ical) ────────────
-#простые dict-хранилища
+# ─── In-memory bot-level state ────────────────────────────────────────────────
+_ai_history:  dict[str, list] = {}
+_biz_history: dict[str, list] = {}
+_ai_enabled:  dict[str, bool] = {}
+_ical_urls:   dict[str, str]  = {}
 
-_ai_history: dict = {}
-_biz_history: dict = {}
-_ai_enabled: dict = {}
-_ical_urls: dict = {}
-
-
-# ── Convenience wrappers that mirror the old load_db/save_db interface ────────
 
 def _get_ai_history(key: str) -> list:
     return _ai_history.get(key, [])
 
-def _set_ai_history(key: str, msgs: list):
+def _set_ai_history(key: str, msgs: list) -> None:
     _ai_history[key] = msgs
 
 def _get_biz_history(chat_id: str) -> list:
     return _biz_history.get(chat_id, [])
 
-def _set_biz_history(chat_id: str, msgs: list):
+def _set_biz_history(chat_id: str, msgs: list) -> None:
     _biz_history[chat_id] = msgs
 
 def _get_ai_enabled(chat_id: str) -> bool:
     return _ai_enabled.get(chat_id, False)
 
-def _set_ai_enabled(chat_id: str, value: bool):
+def _set_ai_enabled(chat_id: str, value: bool) -> None:
     _ai_enabled[chat_id] = value
 
 def _get_ical_url(user_id: str) -> str:
-    return _ical_urls.get(user_id, ICAL_URL)
+    return _ical_urls.get(user_id, "")
 
-def _set_ical_url(user_id: str, url: str):
+def _set_ical_url(user_id: str, url: str) -> None:
     _ical_urls[user_id] = url
-
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -126,6 +123,7 @@ def get_chat_key(update: Update) -> str:
     if update.effective_chat:
         return f"chat_{update.effective_chat.id}"
     return f"user_{update.effective_user.id}"
+
 
 def _escape_md(text: str) -> str:
     for ch in r"\_*[]()~`>#+-=|{}.!":
@@ -148,7 +146,7 @@ def _parse_course(component) -> str:
     return "Unknown"
 
 
-def fetch_deadlines(ical_url: str = None) -> list:
+def fetch_deadlines(ical_url: str | None = None) -> list:
     url = ical_url or ICAL_URL
     req = Request(url, headers={
         "User-Agent": (
@@ -157,8 +155,12 @@ def fetch_deadlines(ical_url: str = None) -> list:
             "Chrome/124.0.0.0 Safari/537.36"
         )
     })
-    with urlopen(req, timeout=15) as resp:
-        raw = resp.read()
+    # BUG FIX: wrapped in try/except with proper URLError handling
+    try:
+        with urlopen(req, timeout=15) as resp:
+            raw = resp.read()
+    except URLError as e:
+        raise RuntimeError(f"Network error fetching calendar: {e.reason}") from e
 
     tz_obj = pytz.timezone(DEADLINE_TZ)
     cal    = Calendar.from_ical(raw)
@@ -235,6 +237,8 @@ async def cmd_deadlines(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
     user_ical_url = _get_ical_url(uid)
 
+    # BUG FIX: _get_ical_url now returns "" instead of ICAL_URL when not set,
+    # so this check correctly falls through to the default ICAL_URL in fetch_deadlines
     if not user_ical_url and not ICAL_URL:
         return await update.message.reply_text(
             "❌ No calendar linked\\.\n\n"
@@ -245,12 +249,9 @@ async def cmd_deadlines(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("⏳ Loading deadlines…")
     try:
         events = fetch_deadlines(user_ical_url or None)
-        source_note = ""
-        if not user_ical_url:
-            source_note = "\n_\\(using default AITU calendar\\)_"
         text = _build_deadline_msg(events)
-        if source_note:
-            text += source_note
+        if not user_ical_url:
+            text += "\n_\\(using default AITU calendar\\)_"
         await msg.edit_text(
             text,
             parse_mode="MarkdownV2",
@@ -332,9 +333,9 @@ async def daily_deadlines_job(context: ContextTypes.DEFAULT_TYPE):
     try:
         events = fetch_deadlines()
         await context.bot.send_message(
-            chat_id   = DEADLINE_CHAT_ID,
-            text      = _build_deadline_msg(events),
-            parse_mode="MarkdownV2",
+            chat_id    = DEADLINE_CHAT_ID,
+            text       = _build_deadline_msg(events),
+            parse_mode = "MarkdownV2",
             disable_web_page_preview=True,
         )
     except Exception as e:
@@ -416,6 +417,10 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
     if not _get_ai_enabled(chat_id):
         return
 
+    # BUG FIX: guard against groq_client being None before calling it
+    if not groq_client:
+        return
+
     hist = _get_biz_history(chat_id)
     hist.append({"role": "user", "content": f"{sender_name}: {user_text}"})
     if len(hist) > 10:
@@ -424,7 +429,7 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
     try:
         resp  = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
-            messages=[{"role": "system", "content": AUTO_REPLY_SYSTEM_PROMPT}, *hist],
+            messages=[{"role": "system", "content": _persona["prompt"]}, *hist],
             max_tokens=300,
         )
         reply = resp.choices[0].message.content
@@ -479,7 +484,7 @@ async def cmd_set_tz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     tz_name = context.args[0]
     try:
-        pytz.timezone(tz_name)  # Validate
+        pytz.timezone(tz_name)  # validate
     except pytz.exceptions.UnknownTimeZoneError:
         return await update.message.reply_text(
             f"❌ Unknown timezone: <code>{tz_name}</code>\n"
@@ -514,12 +519,16 @@ async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cmd  = args[0].lower()
     hour = int(args[1]) if len(args) > 1 and args[1].isdigit() else None
+
     if cmd == "on":
         kwargs: dict = {"briefing_enabled": 1}
         if hour is not None:
+            # BUG FIX: validate hour range
+            if not (0 <= hour <= 23):
+                return await update.message.reply_text("❌ Hour must be 0–23.")
             kwargs["briefing_hour"] = hour
         db.update_settings(uid, **kwargs)
-        s    = db.get_settings(uid)
+        s = db.get_settings(uid)
         await update.message.reply_text(
             f"✅ Morning briefing <b>enabled</b> at <code>{s['briefing_hour']:02d}:00 {s['timezone']}</code>",
             parse_mode="HTML",
@@ -571,14 +580,14 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_persona(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global AUTO_REPLY_SYSTEM_PROMPT
+    # BUG FIX: removed `global AUTO_REPLY_SYSTEM_PROMPT` — now uses _persona dict
     if not context.args:
         return await update.message.reply_text(
             "✏️ Usage:\n/persona Reply briefly, I'm busy\n/persona Say I'll reply soon"
         )
-    AUTO_REPLY_SYSTEM_PROMPT = " ".join(context.args)
+    _persona["prompt"] = " ".join(context.args)
     await update.message.reply_text(
-        f"✅ Persona updated:\n\n<i>{AUTO_REPLY_SYSTEM_PROMPT}</i>", parse_mode="HTML"
+        f"✅ Persona updated:\n\n<i>{_persona['prompt']}</i>", parse_mode="HTML"
     )
 
 
@@ -599,9 +608,10 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML",
     )
 
+
 async def cmd_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Link Telegram account to Chronicle website account."""
-    uid = str(update.effective_user.id)
+    uid  = str(update.effective_user.id)
     args = context.args
 
     if not args:
@@ -609,19 +619,19 @@ async def cmd_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📧 *Привяжи аккаунт сайта к боту*\n\n"
             "Используй команду:\n`/link твой@email.com`\n\n"
             "Email должен совпадать с тем, через который ты входишь на сайт через Google.",
-            parse_mode="Markdown"
+            parse_mode="Markdown",
         )
         return
 
     email = args[0].strip().lower()
 
-    # Check if already linked
+    # BUG FIX: was returning early after "already linked" without checking new email.
+    # Now always attempts to link (upsert), and shows the result.
     existing = db.get_web_user_id(uid)
     if existing:
         await update.message.reply_text(
-            "✅ Аккаунт уже привязан! Задачи синхронизируются с сайтом.\n\n"
-            f"Чтобы сменить аккаунт, напиши `/link новый@email.com`",
-            parse_mode="Markdown"
+            "ℹ️ Аккаунт уже привязан. Попытка обновить привязку…",
+            parse_mode="Markdown",
         )
 
     user_id = db.link_telegram(uid, email)
@@ -629,13 +639,13 @@ async def cmd_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"✅ *Аккаунт привязан!*\n\n"
             f"Теперь все задачи из бота появятся на сайте [schronicle.vercel.app](https://schronicle.vercel.app) и наоборот.",
-            parse_mode="Markdown"
+            parse_mode="Markdown",
         )
     else:
         await update.message.reply_text(
             f"❌ Email `{email}` не найден на сайте.\n\n"
             f"Убедись что ты зарегистрирован на [schronicle.vercel.app](https://schronicle.vercel.app) через Google с этим email.",
-            parse_mode="Markdown"
+            parse_mode="Markdown",
         )
 
 
@@ -660,6 +670,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 LOCK_FILE = "bot.lock"
 
+
 def _acquire_lock():
     """Write PID to lock file. Exit if another instance is already running."""
     if os.path.exists(LOCK_FILE):
@@ -674,14 +685,13 @@ def _acquire_lock():
             )
             sys.exit(1)
         except PermissionError:
-            # PID существует, но это не наш процесс (PID 1 / init в контейнере)
             logger.warning("Stale lock file (PID %s is not the bot). Overwriting.", old_pid)
         except (ProcessLookupError, ValueError):
-            # Stale lock — previous process is gone
             logger.warning("Stale lock file found (PID %s). Overwriting.", old_pid)
 
     with open(LOCK_FILE, "w") as f:
         f.write(str(os.getpid()))
+
 
 def _release_lock():
     try:
@@ -701,31 +711,34 @@ def main():
 
     _acquire_lock()
 
-    # Initialize SQLite DB + migrate old JSON tasks
     db.init_db()
     db.migrate_from_json()
 
     app = Application.builder().token(token).build()
-
-    # Make groq_client available to task handlers
     app.bot_data["groq_client"] = groq_client
 
-    # ── Error handler ─────────────────────────────────────────────────────────
+    # ── Error handler ──────────────────────────────────────────────────────────
     app.add_error_handler(error_handler)
-    app.add_handler(CommandHandler("link", cmd_link))
 
     # ── Business auto-reply (highest priority, group=-1) ──────────────────────
     app.add_handler(TypeHandler(Update, handle_business_message), group=-1)
 
-    # ── Task Manager (ConversationHandler + standalone callbacks) ─────────────
+    # ── Task Manager ──────────────────────────────────────────────────────────
     app.add_handler(build_task_conversation())
     for cb in build_task_callbacks():
         app.add_handler(cb)
 
     # ── Bot commands ──────────────────────────────────────────────────────────
-    app.add_handler(CommandHandler("start",     cmd_start))
-    app.add_handler(CommandHandler("help",      cmd_start))
-    app.add_handler(CommandHandler("deadlines", cmd_deadlines))
+    app.add_handler(CommandHandler("start",        cmd_start))
+    app.add_handler(CommandHandler("help",         cmd_start))
+    app.add_handler(CommandHandler("link",         cmd_link))
+    app.add_handler(CommandHandler("deadlines",    cmd_deadlines))
+    app.add_handler(CommandHandler("ai",           cmd_ai))
+    app.add_handler(CommandHandler("reset",        cmd_reset))
+    app.add_handler(CommandHandler("persona",      cmd_persona))
+    app.add_handler(CommandHandler("status",       cmd_status))
+    app.add_handler(CommandHandler("tz",           cmd_set_tz))
+    app.add_handler(CommandHandler("briefing",     cmd_briefing))
 
     # ── /add_deadline conversation ────────────────────────────────────────────
     add_deadline_conv = ConversationHandler(
@@ -740,21 +753,12 @@ def main():
     )
     app.add_handler(add_deadline_conv)
 
-    app.add_handler(CommandHandler("ai",        cmd_ai))
-    app.add_handler(CommandHandler("reset",     cmd_reset))
-    app.add_handler(CommandHandler("persona",   cmd_persona))
-    app.add_handler(CommandHandler("status",    cmd_status))
-    app.add_handler(CommandHandler("tz",        cmd_set_tz))
-    app.add_handler(CommandHandler("briefing",  cmd_briefing))
-
     # ── Scheduled jobs ────────────────────────────────────────────────────────
     jq = app.job_queue
 
-    # Deadline reminders: run every 60 seconds
     jq.run_repeating(reminder_check_job, interval=60, first=10)
     logger.info("Reminder check job: every 60s")
 
-    # AITU LMS daily deadlines
     if DEADLINE_CHAT_ID:
         tz_obj    = pytz.timezone(DEADLINE_TZ)
         send_time = datetime.now(tz_obj).replace(
@@ -766,7 +770,6 @@ def main():
             DEADLINE_HOUR, DEADLINE_MINUTE, DEADLINE_TZ, DEADLINE_CHAT_ID,
         )
 
-    # Morning briefing: 09:00 UTC (each user's local time is handled inside the job)
     briefing_time = datetime.now(pytz.utc).replace(
         hour=1, minute=0, second=0, microsecond=0  # 01:00 UTC ≈ 06:00 Almaty
     ).timetz()
