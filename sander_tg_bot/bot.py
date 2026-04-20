@@ -81,18 +81,45 @@ DEADLINE_MINUTE  = int(os.getenv("DEADLINE_MINUTE", "0"))
 DEADLINE_TZ      = os.getenv("DEADLINE_TZ", "Asia/Almaty")
 DAYS_AHEAD       = int(os.getenv("DAYS_AHEAD", "7"))
 
-# ─── Simple JSON DB (AI history + business history only) ─────────────────────
-DB_FILE = os.path.join(os.getenv("DATA_DIR", "."), "data.json")
+# ─── MongoDB helpers for bot-level data (history, settings, ical) ────────────
 
-def load_db() -> dict:
-    if os.path.exists(DB_FILE):
-        with open(DB_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {"ai_history": {}, "business_history": {}, "ai_enabled": {}, "ical_urls": {}}
+def _bot_col():
+    """Reuse the same MongoDB client from db.py."""
+    import db as _db_module
+    return _db_module._col("bot_data")
 
-def save_db(d: dict):
-    with open(DB_FILE, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
+def _get_doc(key: str) -> dict:
+    doc = _bot_col().find_one({"_id": key})
+    return doc.get("value", {}) if doc else {}
+
+def _set_doc(key: str, value: dict):
+    _bot_col().replace_one({"_id": key}, {"_id": key, "value": value}, upsert=True)
+
+# ── Convenience wrappers that mirror the old load_db/save_db interface ────────
+
+def _get_ai_history(key: str) -> list:
+    return _get_doc(f"ai_history:{key}").get("msgs", [])
+
+def _set_ai_history(key: str, msgs: list):
+    _set_doc(f"ai_history:{key}", {"msgs": msgs})
+
+def _get_biz_history(chat_id: str) -> list:
+    return _get_doc(f"biz_history:{chat_id}").get("msgs", [])
+
+def _set_biz_history(chat_id: str, msgs: list):
+    _set_doc(f"biz_history:{chat_id}", {"msgs": msgs})
+
+def _get_ai_enabled(chat_id: str) -> bool:
+    return bool(_get_doc(f"ai_enabled:{chat_id}").get("enabled", False))
+
+def _set_ai_enabled(chat_id: str, value: bool):
+    _set_doc(f"ai_enabled:{chat_id}", {"enabled": value})
+
+def _get_ical_url(user_id: str) -> str:
+    return _get_doc(f"ical_url:{user_id}").get("url", "")
+
+def _set_ical_url(user_id: str, url: str):
+    _set_doc(f"ical_url:{user_id}", {"url": url})
 
 def get_chat_key(update: Update) -> str:
     return str(update.effective_chat.id)
@@ -208,8 +235,7 @@ def _build_deadline_msg(events: list) -> str:
 
 async def cmd_deadlines(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
-    d = load_db()
-    user_ical_url = d.get("ical_urls", {}).get(uid)
+    user_ical_url = _get_ical_url(uid)
 
     if not user_ical_url and not ICAL_URL:
         return await update.message.reply_text(
@@ -220,7 +246,7 @@ async def cmd_deadlines(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = await update.message.reply_text("⏳ Loading deadlines…")
     try:
-        events = fetch_deadlines(user_ical_url)
+        events = fetch_deadlines(user_ical_url or None)
         source_note = ""
         if not user_ical_url:
             source_note = "\n_\\(using default AITU calendar\\)_"
@@ -243,8 +269,7 @@ async def cmd_deadlines(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_add_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start conversation: ask user to send their iCal URL."""
     uid = str(update.effective_user.id)
-    d = load_db()
-    existing = d.get("ical_urls", {}).get(uid)
+    existing = _get_ical_url(uid)
     hint = ""
     if existing:
         short = existing[:60] + "…" if len(existing) > 60 else existing
@@ -278,9 +303,7 @@ async def receive_ical_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     checking = await update.message.reply_text("⏳ Checking calendar…")
     try:
         events = fetch_deadlines(url)
-        d = load_db()
-        d.setdefault("ical_urls", {})[uid] = url
-        save_db(d)
+        _set_ical_url(uid, url)
         count = len(events)
         await checking.edit_text(
             f"✅ *Calendar saved\\!*\n\n"
@@ -330,9 +353,6 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
         return
     if message.from_user and message.from_user.is_bot:
         return
-    # Только бизнес-чаты
-    if not update.business_message:
-        return
 
     chat_id     = str(message.chat.id)
     user_text   = message.text.strip()
@@ -365,15 +385,11 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
                     reply = "❌ AI unavailable. Try later."
 
         elif cmd == "stop":
-            d = load_db()
-            d.setdefault("ai_enabled", {})[chat_id] = False
-            save_db(d)
+            _set_ai_enabled(chat_id, False)
             reply = "🔇 AI auto-reply disabled.\nSend /resume to re-enable."
 
         elif cmd == "resume":
-            d = load_db()
-            d.setdefault("ai_enabled", {})[chat_id] = True
-            save_db(d)
+            _set_ai_enabled(chat_id, True)
             reply = "🔊 AI auto-reply enabled!"
 
         elif cmd == "help":
@@ -399,12 +415,10 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
         return
 
     # ── Auto-reply ──
-    d = load_db()
-    if not d.get("ai_enabled", {}).get(chat_id):
+    if not _get_ai_enabled(chat_id):
         return
 
-    d.setdefault("business_history", {}).setdefault(chat_id, [])
-    hist = d["business_history"][chat_id]
+    hist = _get_biz_history(chat_id)
     hist.append({"role": "user", "content": f"{sender_name}: {user_text}"})
     if len(hist) > 10:
         hist = hist[-10:]
@@ -417,8 +431,7 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
         )
         reply = resp.choices[0].message.content
         hist.append({"role": "assistant", "content": reply})
-        d["business_history"][chat_id] = hist
-        save_db(d)
+        _set_biz_history(chat_id, hist)
         await context.bot.send_message(
             chat_id=message.chat.id,
             text=reply,
@@ -526,11 +539,9 @@ async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         return await update.message.reply_text("✏️ /ai how do I bake bread?")
 
-    key   = get_chat_key(update)
-    d     = load_db()
-    d.setdefault("ai_history", {}).setdefault(key, [])
-    msg   = " ".join(context.args)
-    hist  = d["ai_history"][key]
+    key  = get_chat_key(update)
+    msg  = " ".join(context.args)
+    hist = _get_ai_history(key)
     hist.append({"role": "user", "content": msg})
     if len(hist) > 20:
         hist = hist[-20:]
@@ -547,8 +558,7 @@ async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         reply = resp.choices[0].message.content
         hist.append({"role": "assistant", "content": reply})
-        d["ai_history"][key] = hist
-        save_db(d)
+        _set_ai_history(key, hist)
         await thinking.delete()
         await update.message.reply_text("🤖 " + reply)
     except Exception as e:
@@ -558,9 +568,7 @@ async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     key = get_chat_key(update)
-    d   = load_db()
-    d.setdefault("ai_history", {})[key] = []
-    save_db(d)
+    _set_ai_history(key, [])
     await update.message.reply_text("🔄 AI history cleared.")
 
 
