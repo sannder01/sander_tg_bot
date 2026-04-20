@@ -668,26 +668,47 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 #  LOCK FILE (prevent duplicate instances)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-LOCK_FILE = "bot.lock"
+LOCK_FILE     = "bot.lock"
+# Set DISABLE_LOCK_FILE=1 in Railway/Docker — the platform already ensures a single instance.
+_LOCK_ENABLED = os.getenv("DISABLE_LOCK_FILE", "0") not in ("1", "true", "yes")
 
 
 def _acquire_lock():
-    """Write PID to lock file. Exit if another instance is already running."""
+    """Write PID to lock file. Exit if another instance is already running.
+
+    Container-safe: PID 1 is always the init process (tini/sh), never our bot.
+    A lock file referencing PID 1 is therefore always stale and is overwritten.
+    """
     if os.path.exists(LOCK_FILE):
         with open(LOCK_FILE) as f:
-            old_pid = f.read().strip()
+            raw = f.read().strip()
         try:
-            os.kill(int(old_pid), 0)
-            logger.error(
-                "Another bot instance is running (PID %s). "
-                "Stop it first or delete '%s'.",
-                old_pid, LOCK_FILE,
-            )
-            sys.exit(1)
-        except PermissionError:
-            logger.warning("Stale lock file (PID %s is not the bot). Overwriting.", old_pid)
-        except (ProcessLookupError, ValueError):
-            logger.warning("Stale lock file found (PID %s). Overwriting.", old_pid)
+            old_pid = int(raw)
+        except ValueError:
+            logger.warning("Corrupt lock file (content %r). Overwriting.", raw)
+            old_pid = None
+
+        if old_pid is not None:
+            # PID 1 is init — never our bot process, always stale.
+            if old_pid == 1:
+                logger.warning("Lock file references PID 1 (init/container). Overwriting.")
+            else:
+                try:
+                    os.kill(old_pid, 0)
+                    # Process exists and we can signal it → it really is alive.
+                    logger.error(
+                        "Another bot instance is running (PID %s). "
+                        "Stop it first or delete '%s'.",
+                        old_pid, LOCK_FILE,
+                    )
+                    sys.exit(1)
+                except PermissionError:
+                    # os.kill succeeded (process exists) but we lack permission — treat as stale.
+                    logger.warning(
+                        "Lock file PID %s exists but is not our process. Overwriting.", old_pid
+                    )
+                except ProcessLookupError:
+                    logger.warning("Stale lock file (PID %s gone). Overwriting.", old_pid)
 
     with open(LOCK_FILE, "w") as f:
         f.write(str(os.getpid()))
@@ -709,7 +730,8 @@ def main():
     if not token:
         raise ValueError("TELEGRAM_BOT_TOKEN not set in .env!")
 
-    _acquire_lock()
+    if _LOCK_ENABLED:
+        _acquire_lock()
 
     db.init_db()
     db.migrate_from_json()
@@ -780,7 +802,8 @@ def main():
     try:
         app.run_polling(allowed_updates=Update.ALL_TYPES)
     finally:
-        _release_lock()
+        if _LOCK_ENABLED:
+            _release_lock()
 
 
 if __name__ == "__main__":
