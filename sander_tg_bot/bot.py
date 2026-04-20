@@ -28,6 +28,9 @@ from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
+    ConversationHandler,
+    MessageHandler,
+    filters,
     ContextTypes,
     TypeHandler,
 )
@@ -40,6 +43,9 @@ from tasks import (
     daily_briefing_job,
     reminder_check_job,
 )
+
+# ─── Conversation states ──────────────────────────────────────────────────────
+WAITING_ICAL_URL = 1
 
 # ─── Bootstrap ────────────────────────────────────────────────────────────────
 load_dotenv()
@@ -82,7 +88,7 @@ def load_db() -> dict:
     if os.path.exists(DB_FILE):
         with open(DB_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    return {"ai_history": {}, "business_history": {}, "ai_enabled": {}}
+    return {"ai_history": {}, "business_history": {}, "ai_enabled": {}, "ical_urls": {}}
 
 def save_db(d: dict):
     with open(DB_FILE, "w", encoding="utf-8") as f:
@@ -117,8 +123,9 @@ def _parse_course(component) -> str:
     return "Unknown"
 
 
-def fetch_deadlines() -> list:
-    req = Request(ICAL_URL, headers={
+def fetch_deadlines(ical_url: str = None) -> list:
+    url = ical_url or ICAL_URL
+    req = Request(url, headers={
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -200,11 +207,28 @@ def _build_deadline_msg(events: list) -> str:
 
 
 async def cmd_deadlines(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    d = load_db()
+    user_ical_url = d.get("ical_urls", {}).get(uid)
+
+    if not user_ical_url and not ICAL_URL:
+        return await update.message.reply_text(
+            "❌ No calendar linked\\.\n\n"
+            "Use /add\\_deadline to add your iCal URL\\.",
+            parse_mode="MarkdownV2",
+        )
+
     msg = await update.message.reply_text("⏳ Loading deadlines…")
     try:
-        events = fetch_deadlines()
+        events = fetch_deadlines(user_ical_url)
+        source_note = ""
+        if not user_ical_url:
+            source_note = "\n_\\(using default AITU calendar\\)_"
+        text = _build_deadline_msg(events)
+        if source_note:
+            text += source_note
         await msg.edit_text(
-            _build_deadline_msg(events),
+            text,
             parse_mode="MarkdownV2",
             disable_web_page_preview=True,
         )
@@ -214,6 +238,71 @@ async def cmd_deadlines(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"❌ Failed to load deadlines:\n<code>{e}</code>",
             parse_mode="HTML",
         )
+
+
+async def cmd_add_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start conversation: ask user to send their iCal URL."""
+    uid = str(update.effective_user.id)
+    d = load_db()
+    existing = d.get("ical_urls", {}).get(uid)
+    hint = ""
+    if existing:
+        short = existing[:60] + "…" if len(existing) > 60 else existing
+        hint = f"\n\n_Current URL:_ `{_escape_md(short)}`"
+
+    await update.message.reply_text(
+        "📅 *Add your calendar*\n\n"
+        "Send your iCal \\(`.ics`\\) URL\\.\n\n"
+        "In Moodle/LMS: *Calendar → Export → copy the link*\\."
+        + hint
+        + "\n\nSend /cancel to abort\\.",
+        parse_mode="MarkdownV2",
+    )
+    return WAITING_ICAL_URL
+
+
+async def receive_ical_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Save the iCal URL sent by the user and validate it."""
+    uid = str(update.effective_user.id)
+    url = update.message.text.strip()
+
+    if not (url.startswith("http://") or url.startswith("https://")):
+        await update.message.reply_text(
+            "❌ That doesn't look like a valid URL\\.\n"
+            "Please send a link starting with `https://`\\.\n\n"
+            "Try again or /cancel\\.",
+            parse_mode="MarkdownV2",
+        )
+        return WAITING_ICAL_URL
+
+    checking = await update.message.reply_text("⏳ Checking calendar…")
+    try:
+        events = fetch_deadlines(url)
+        d = load_db()
+        d.setdefault("ical_urls", {})[uid] = url
+        save_db(d)
+        count = len(events)
+        await checking.edit_text(
+            f"✅ *Calendar saved\\!*\n\n"
+            f"Found *{count}* upcoming deadline{'s' if count != 1 else ''}\\.\n"
+            f"Use /deadlines to view them\\.",
+            parse_mode="MarkdownV2",
+        )
+    except Exception as e:
+        logger.error("iCal validation error: %s", e)
+        await checking.edit_text(
+            f"❌ Could not load that calendar:\n<code>{e}</code>\n\n"
+            "Double-check the URL and try again, or /cancel\\.",
+            parse_mode="HTML",
+        )
+        return WAITING_ICAL_URL
+
+    return ConversationHandler.END
+
+
+async def cmd_cancel_ical(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❌ Cancelled\\.", parse_mode="MarkdownV2")
+    return ConversationHandler.END
 
 
 async def daily_deadlines_job(context: ContextTypes.DEFAULT_TYPE):
@@ -350,7 +439,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  🔹  /tasks      — <i>Task Manager</i>\n"
         "         ↳ NLP add · Calendar · Analytics\n"
         "         ↳ Reminders · Archive\n"
-        "  🔹  /deadlines  — <i>AITU LMS Deadlines</i>\n"
+        "  🔹  /deadlines    — <i>Your calendar deadlines</i>\n"
+        "  🔹  /add_deadline — <i>Link your iCal calendar</i>\n"
         "  🔹  /ai         — <i>AI Assistant</i>\n"
         "  🔹  /tz         — <i>Set your timezone</i>\n"
         "  🔹  /briefing   — <i>Toggle morning briefing</i>\n"
@@ -586,6 +676,20 @@ def main():
     app.add_handler(CommandHandler("start",     cmd_start))
     app.add_handler(CommandHandler("help",      cmd_start))
     app.add_handler(CommandHandler("deadlines", cmd_deadlines))
+
+    # ── /add_deadline conversation ────────────────────────────────────────────
+    add_deadline_conv = ConversationHandler(
+        entry_points=[CommandHandler("add_deadline", cmd_add_deadline)],
+        states={
+            WAITING_ICAL_URL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_ical_url),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cmd_cancel_ical)],
+        allow_reentry=True,
+    )
+    app.add_handler(add_deadline_conv)
+
     app.add_handler(CommandHandler("ai",        cmd_ai))
     app.add_handler(CommandHandler("reset",     cmd_reset))
     app.add_handler(CommandHandler("persona",   cmd_persona))
