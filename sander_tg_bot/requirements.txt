@@ -4,8 +4,8 @@
 # Telegram bot framework (with job-queue scheduler built in)
 python-telegram-bot[job-queue]==21.5
 
-pymongo>=4.7.0
-certifi>=2024.0.0
+# PostgreSQL (replaces MongoDB)
+psycopg2-binary>=2.9.0
 
 # AI inference (NLP parsing + AI chat)
 groq>=0.9.0
