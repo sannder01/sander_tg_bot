@@ -170,15 +170,13 @@ def get_tz(tg_user_id: str) -> str:
 def update_settings(tg_user_id: str, **kwargs):
     if not kwargs:
         return
+    # Ensure row exists
+    _exec("""
+        INSERT INTO bot_user_settings (tg_user_id)
+        VALUES (%s) ON CONFLICT DO NOTHING
+    """, (tg_user_id,))
     sets = ", ".join(f"{k} = %s" for k in kwargs)
     vals = list(kwargs.values()) + [tg_user_id]
-    _exec(f"""
-        INSERT INTO bot_user_settings (tg_user_id) VALUES (%s)
-        ON CONFLICT (tg_user_id) DO UPDATE SET {sets}
-    """.replace("INSERT INTO bot_user_settings (tg_user_id) VALUES (%s)", 
-                f"INSERT INTO bot_user_settings (tg_user_id, {', '.join(kwargs.keys())}) VALUES (%s, {', '.join(['%s']*len(kwargs))})"),
-        [tg_user_id] + list(kwargs.values()))
-    # Simpler approach:
     _exec(f"UPDATE bot_user_settings SET {sets} WHERE tg_user_id = %s", vals)
 
 
