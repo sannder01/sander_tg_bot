@@ -1,84 +1,64 @@
 """
-db.py — Chronicle Engine: SQLite Persistence Layer
+db.py — Chronicle Engine: MongoDB Persistence Layer
 ====================================================
-Schema
-  tasks        — full task records with lifecycle fields
+Collections:
+  tasks         — full task records with lifecycle fields
   user_settings — per-user timezone + briefing prefs
+  counters      — auto-increment for task IDs
 """
 
-import sqlite3
 import os
 import json
 import logging
 from datetime import datetime, timedelta, timezone
-from contextlib import contextmanager
 from typing import Optional, List
 
+from pymongo import MongoClient, ASCENDING
+from pymongo.collection import Collection
+
 logger = logging.getLogger(__name__)
-DB_PATH = os.getenv("TASKS_DB", "tasks.db")
+
+MONGO_URI = os.getenv("MONGODB_URI", "")
+_client: Optional[MongoClient] = None
 
 
 # ── Connection ────────────────────────────────────────────────────────────────
 
-@contextmanager
-def _conn():
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA journal_mode=WAL")
-    con.execute("PRAGMA foreign_keys=ON")
-    try:
-        yield con
-        con.commit()
-    except Exception:
-        con.rollback()
-        raise
-    finally:
-        con.close()
+def _db():
+    global _client
+    if _client is None:
+        _client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+    return _client["chronicle"]
+
+
+def _col(name: str) -> Collection:
+    return _db()[name]
+
+
+def _next_id() -> int:
+    """Auto-increment counter for task IDs."""
+    result = _col("counters").find_one_and_update(
+        {"_id": "task_id"},
+        {"$inc": {"seq": 1}},
+        upsert=True,
+        return_document=True,
+    )
+    return result["seq"]
 
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
 
 def init_db():
-    """Create tables and indexes if they don't exist."""
-    with _conn() as con:
-        con.executescript("""
-            CREATE TABLE IF NOT EXISTS tasks (
-                id               INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id          TEXT    NOT NULL,
-                text             TEXT    NOT NULL,
-                status           TEXT    NOT NULL DEFAULT 'todo'
-                                         CHECK(status IN ('todo','in_progress','done')),
-                priority         TEXT    NOT NULL DEFAULT 'medium'
-                                         CHECK(priority IN ('high','medium','low')),
-                deadline         TEXT,                     -- UTC ISO "YYYY-MM-DDTHH:MM:SS"
-                created_at       TEXT    NOT NULL,          -- UTC ISO
-                completed_at     TEXT,                     -- UTC ISO, set when done
-                archived         INTEGER NOT NULL DEFAULT 0,
-                reminder_24h     INTEGER NOT NULL DEFAULT 0,
-                reminder_1h      INTEGER NOT NULL DEFAULT 0,
-                reminder_15m     INTEGER NOT NULL DEFAULT 0
-            );
-
-            CREATE TABLE IF NOT EXISTS user_settings (
-                user_id          TEXT PRIMARY KEY,
-                timezone         TEXT    NOT NULL DEFAULT 'Asia/Almaty',
-                briefing_hour    INTEGER NOT NULL DEFAULT 9,
-                briefing_enabled INTEGER NOT NULL DEFAULT 1
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_tasks_user     ON tasks(user_id, archived);
-            CREATE INDEX IF NOT EXISTS idx_tasks_deadline ON tasks(deadline)
-                WHERE deadline IS NOT NULL;
-            CREATE INDEX IF NOT EXISTS idx_tasks_remind   ON tasks(reminder_24h, reminder_1h, reminder_15m)
-                WHERE archived=0 AND status != 'done';
-        """)
-    logger.info("DB initialized at %s", DB_PATH)
+    """Create indexes."""
+    tasks = _col("tasks")
+    tasks.create_index([("user_id", ASCENDING), ("archived", ASCENDING)])
+    tasks.create_index([("deadline", ASCENDING)], sparse=True)
+    logger.info("MongoDB initialized — db: chronicle")
 
 
-# ── Migration: tasks.json → SQLite ───────────────────────────────────────────
+# ── Migration: tasks.json → MongoDB ──────────────────────────────────────────
 
 def migrate_from_json(json_path: str = "tasks.json"):
-    """One-time import from the old flat-file format."""
     if not os.path.exists(json_path):
         return
     try:
@@ -103,24 +83,40 @@ def migrate_from_json(json_path: str = "tasks.json"):
         logger.warning("Migration skipped: %s", e)
 
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _now_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+_PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2}
+
+
+def _sort_tasks(tasks: List[dict]) -> List[dict]:
+    return sorted(
+        tasks,
+        key=lambda t: (
+            _PRIORITY_ORDER.get(t.get("priority", "medium"), 1),
+            0 if t.get("deadline") else 1,
+            t.get("deadline") or "",
+            -(t.get("id") or 0),
+        ),
+    )
+
+
 # ── User Settings ─────────────────────────────────────────────────────────────
 
+_DEFAULTS = {"timezone": "Asia/Almaty", "briefing_hour": 9, "briefing_enabled": 1}
+
+
 def get_settings(user_id: str) -> dict:
-    with _conn() as con:
-        row = con.execute(
-            "SELECT * FROM user_settings WHERE user_id=?", (user_id,)
-        ).fetchone()
-        if row:
-            return dict(row)
-        con.execute(
-            "INSERT OR IGNORE INTO user_settings(user_id) VALUES(?)", (user_id,)
-        )
-        return {
-            "user_id": user_id,
-            "timezone": "Asia/Almaty",
-            "briefing_hour": 9,
-            "briefing_enabled": 1,
-        }
+    doc = _col("user_settings").find_one({"user_id": user_id})
+    if doc:
+        doc.pop("_id", None)
+        return doc
+    new = {"user_id": user_id, **_DEFAULTS}
+    _col("user_settings").insert_one({**new})
+    return new
 
 
 def get_tz(user_id: str) -> str:
@@ -130,18 +126,7 @@ def get_tz(user_id: str) -> str:
 def update_settings(user_id: str, **kwargs):
     if not kwargs:
         return
-    with _conn() as con:
-        # Ensure row exists
-        con.execute("INSERT OR IGNORE INTO user_settings(user_id) VALUES(?)", (user_id,))
-        set_clause = ", ".join(f"{k}=?" for k in kwargs)
-        values = list(kwargs.values()) + [user_id]
-        con.execute(f"UPDATE user_settings SET {set_clause} WHERE user_id=?", values)
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _now_utc() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    _col("user_settings").update_one({"user_id": user_id}, {"$set": kwargs}, upsert=True)
 
 
 # ── Task CRUD ─────────────────────────────────────────────────────────────────
@@ -153,100 +138,76 @@ def add_task(
     deadline_utc: Optional[str] = None,
     status: str = "todo",
 ) -> int:
-    with _conn() as con:
-        cur = con.execute(
-            """INSERT INTO tasks(user_id, text, priority, deadline, created_at, status)
-               VALUES(?,?,?,?,?,?)""",
-            (user_id, text, priority, deadline_utc, _now_utc(), status),
-        )
-        return cur.lastrowid
+    task_id = _next_id()
+    _col("tasks").insert_one({
+        "id":           task_id,
+        "user_id":      user_id,
+        "text":         text,
+        "status":       status,
+        "priority":     priority,
+        "deadline":     deadline_utc,
+        "created_at":   _now_utc(),
+        "completed_at": None,
+        "archived":     0,
+        "reminder_24h": 0,
+        "reminder_1h":  0,
+        "reminder_15m": 0,
+    })
+    return task_id
 
 
 def get_tasks(user_id: str, archived: bool = False) -> List[dict]:
-    with _conn() as con:
-        rows = con.execute(
-            """SELECT * FROM tasks WHERE user_id=? AND archived=?
-               ORDER BY
-                 CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
-                 CASE WHEN deadline IS NULL THEN 1 ELSE 0 END,
-                 deadline ASC,
-                 created_at DESC""",
-            (user_id, int(archived)),
-        ).fetchall()
-        return [dict(r) for r in rows]
+    docs = list(_col("tasks").find({"user_id": user_id, "archived": int(archived)}, {"_id": 0}))
+    return _sort_tasks(docs)
 
 
 def get_task(task_id: int) -> Optional[dict]:
-    with _conn() as con:
-        row = con.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
-        return dict(row) if row else None
+    return _col("tasks").find_one({"id": task_id}, {"_id": 0})
 
 
 def update_task(task_id: int, **kwargs):
     if not kwargs:
         return
-    set_clause = ", ".join(f"{k}=?" for k in kwargs)
-    with _conn() as con:
-        con.execute(
-            f"UPDATE tasks SET {set_clause} WHERE id=?",
-            list(kwargs.values()) + [task_id],
-        )
+    _col("tasks").update_one({"id": task_id}, {"$set": kwargs})
 
 
 def set_status(task_id: int, status: str):
     kwargs: dict = {"status": status}
-    if status == "done":
-        kwargs["completed_at"] = _now_utc()
-    else:
-        kwargs["completed_at"] = None
+    kwargs["completed_at"] = _now_utc() if status == "done" else None
     update_task(task_id, **kwargs)
 
 
 def delete_task(task_id: int):
-    with _conn() as con:
-        con.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+    _col("tasks").delete_one({"id": task_id})
 
 
 def archive_done_tasks(user_id: str) -> int:
-    """Move all 'done' tasks to archive. Returns count archived."""
-    with _conn() as con:
-        cur = con.execute(
-            """UPDATE tasks SET archived=1
-               WHERE user_id=? AND status='done' AND archived=0""",
-            (user_id,),
-        )
-        return cur.rowcount
+    result = _col("tasks").update_many(
+        {"user_id": user_id, "status": "done", "archived": 0},
+        {"$set": {"archived": 1}},
+    )
+    return result.modified_count
 
 
 # ── Calendar Query ────────────────────────────────────────────────────────────
 
 def get_tasks_for_month(user_id: str, year: int, month: int) -> dict:
-    """
-    Returns {day_int: [task_dicts]} for tasks with deadlines in this month.
-    Deadlines stored in UTC; we group by calendar day in UTC for simplicity.
-    """
     import calendar as cal_mod
-
-    last_day = cal_mod.monthrange(year, month)[1]
+    last_day    = cal_mod.monthrange(year, month)[1]
     month_start = f"{year:04d}-{month:02d}-01T00:00:00"
     month_end   = f"{year:04d}-{month:02d}-{last_day:02d}T23:59:59"
 
-    with _conn() as con:
-        rows = con.execute(
-            """SELECT id, text, status, priority, deadline
-               FROM tasks
-               WHERE user_id=? AND archived=0 AND deadline IS NOT NULL
-               AND deadline BETWEEN ? AND ?
-               ORDER BY deadline ASC""",
-            (user_id, month_start, month_end),
-        ).fetchall()
+    docs = list(_col("tasks").find(
+        {"user_id": user_id, "archived": 0,
+         "deadline": {"$ne": None, "$gte": month_start, "$lte": month_end}},
+        {"_id": 0, "id": 1, "text": 1, "status": 1, "priority": 1, "deadline": 1},
+    ).sort("deadline", ASCENDING))
 
     result: dict = {}
-    for row in rows:
-        d = dict(row)
+    for doc in docs:
         try:
-            dt = datetime.fromisoformat(d["deadline"])
-            result.setdefault(dt.day, []).append(d)
+            dt = datetime.fromisoformat(doc["deadline"])
+            result.setdefault(dt.day, []).append(doc)
         except Exception:
             pass
     return result
@@ -255,10 +216,6 @@ def get_tasks_for_month(user_id: str, year: int, month: int) -> dict:
 # ── Reminder Queries ──────────────────────────────────────────────────────────
 
 def get_tasks_needing_reminders() -> List[tuple]:
-    """
-    Returns list of (flag_col, task_dict) for tasks whose deadline falls
-    inside a reminder window and whose flag hasn't been sent yet.
-    """
     now = datetime.now(timezone.utc)
     windows = [
         ("reminder_15m", now + timedelta(minutes=10), now + timedelta(minutes=20)),
@@ -266,78 +223,56 @@ def get_tasks_needing_reminders() -> List[tuple]:
         ("reminder_24h", now + timedelta(hours=23),   now + timedelta(hours=25)),
     ]
     results = []
-    with _conn() as con:
-        for flag, t_min, t_max in windows:
-            rows = con.execute(
-                f"""SELECT * FROM tasks
-                    WHERE {flag}=0 AND status!='done' AND archived=0
-                    AND deadline IS NOT NULL
-                    AND deadline BETWEEN ? AND ?""",
-                (t_min.strftime("%Y-%m-%dT%H:%M:%S"),
-                 t_max.strftime("%Y-%m-%dT%H:%M:%S")),
-            ).fetchall()
-            for row in rows:
-                results.append((flag, dict(row)))
+    for flag, t_min, t_max in windows:
+        docs = list(_col("tasks").find(
+            {flag: 0, "status": {"$ne": "done"}, "archived": 0,
+             "deadline": {
+                 "$gte": t_min.strftime("%Y-%m-%dT%H:%M:%S"),
+                 "$lte": t_max.strftime("%Y-%m-%dT%H:%M:%S"),
+             }},
+            {"_id": 0},
+        ))
+        for doc in docs:
+            results.append((flag, doc))
     return results
 
 
 def mark_reminder_sent(task_id: int, flag: str):
-    with _conn() as con:
-        con.execute(f"UPDATE tasks SET {flag}=1 WHERE id=?", (task_id,))
+    _col("tasks").update_one({"id": task_id}, {"$set": {flag: 1}})
 
 
 # ── Analytics ─────────────────────────────────────────────────────────────────
 
 def get_analytics(user_id: str) -> dict:
-    now = datetime.now(timezone.utc)
+    now             = datetime.now(timezone.utc)
     week_start      = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
     last_week_start = week_start - timedelta(weeks=1)
+    ws  = week_start.strftime("%Y-%m-%dT%H:%M:%S")
+    lws = last_week_start.strftime("%Y-%m-%dT%H:%M:%S")
 
-    with _conn() as con:
-        total_active = con.execute(
-            "SELECT COUNT(*) FROM tasks WHERE user_id=? AND archived=0", (user_id,)
-        ).fetchone()[0]
+    col = _col("tasks")
+    total_active   = col.count_documents({"user_id": user_id, "archived": 0})
+    done_this_week = col.count_documents({"user_id": user_id, "status": "done", "completed_at": {"$gte": ws}})
+    done_last_week = col.count_documents({"user_id": user_id, "status": "done", "completed_at": {"$gte": lws, "$lt": ws}})
+    total_archived = col.count_documents({"user_id": user_id, "archived": 1})
+    total_ever     = col.count_documents({"user_id": user_id})
 
-        done_this_week = con.execute(
-            """SELECT COUNT(*) FROM tasks WHERE user_id=? AND status='done'
-               AND completed_at >= ?""",
-            (user_id, week_start.strftime("%Y-%m-%dT%H:%M:%S")),
-        ).fetchone()[0]
+    by_status: dict = {}
+    for doc in col.aggregate([
+        {"$match": {"user_id": user_id, "archived": 0}},
+        {"$group": {"_id": "$status", "count": {"$sum": 1}}},
+    ]):
+        by_status[doc["_id"]] = doc["count"]
 
-        done_last_week = con.execute(
-            """SELECT COUNT(*) FROM tasks WHERE user_id=?
-               AND status='done' AND completed_at >= ? AND completed_at < ?""",
-            (user_id,
-             last_week_start.strftime("%Y-%m-%dT%H:%M:%S"),
-             week_start.strftime("%Y-%m-%dT%H:%M:%S")),
-        ).fetchone()[0]
-
-        by_status = {
-            r[0]: r[1]
-            for r in con.execute(
-                "SELECT status, COUNT(*) FROM tasks WHERE user_id=? AND archived=0 GROUP BY status",
-                (user_id,),
-            ).fetchall()
-        }
-
-        by_priority = {
-            r[0]: r[1]
-            for r in con.execute(
-                "SELECT priority, COUNT(*) FROM tasks WHERE user_id=? AND archived=0 GROUP BY priority",
-                (user_id,),
-            ).fetchall()
-        }
-
-        total_archived = con.execute(
-            "SELECT COUNT(*) FROM tasks WHERE user_id=? AND archived=1", (user_id,)
-        ).fetchone()[0]
-
-        total_ever = con.execute(
-            "SELECT COUNT(*) FROM tasks WHERE user_id=?", (user_id,)
-        ).fetchone()[0]
+    by_priority: dict = {}
+    for doc in col.aggregate([
+        {"$match": {"user_id": user_id, "archived": 0}},
+        {"$group": {"_id": "$priority", "count": {"$sum": 1}}},
+    ]):
+        by_priority[doc["_id"]] = doc["count"]
 
     return {
-        "total_active":  total_active,
+        "total_active":   total_active,
         "done_this_week": done_this_week,
         "done_last_week": done_last_week,
         "by_status":      by_status,
