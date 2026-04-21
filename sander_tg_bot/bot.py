@@ -347,7 +347,7 @@ async def daily_deadlines_job(context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.business_message or update.message
+    message = update.business_message
     if not message or not message.text:
         return
     if message.from_user and message.from_user.is_bot:
