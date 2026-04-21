@@ -68,14 +68,17 @@ def _task_text(t: dict) -> str:
 
 def _task_deadline(t: dict) -> Optional[str]:
     """Return the deadline/due_date as a string, normalising field names."""
-    # Tasks stored in DB have due_date (DATE); older in-memory tasks may have "deadline" (ISO str)
     raw = t.get("deadline") or t.get("due_date")
     if raw is None:
         return None
+    due_time = t.get("due_time")  # e.g. "18:30"
     if isinstance(raw, date):
-        return raw.isoformat()
-    return str(raw)
-
+        date_str = raw.isoformat()
+    else:
+        date_str = str(raw)[:10]  # берём только дату "2026-04-23"
+    if due_time:
+        return f"{date_str}T{due_time}:00"  # "2026-04-23T18:30:00"
+    return f"{date_str}T00:00:00"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  UI BUILDERS
