@@ -466,6 +466,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  🔹  /persona    — <i>Set AI auto-reply style</i>\n"
         "  🔹  /status     — <i>System status</i>\n"
         "  🔹  /reset      — <i>Reset AI history</i>\n\n"
+        "  🔹  /link       — <i>Link a website account: https://schronicle.vercel.app</i>\\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "  Start with /tasks to manage your day.",
         parse_mode="HTML",
