@@ -42,6 +42,7 @@ from tasks import (
     daily_briefing_job,
     reminder_check_job,
 )
+from habits import build_habit_conversation, build_habit_callbacks
 
 # ─── Conversation states ───────────────────────────────────────────────────────
 WAITING_ICAL_URL = 1
@@ -749,6 +750,11 @@ def main():
     # ── Task Manager ──────────────────────────────────────────────────────────
     app.add_handler(build_task_conversation())
     for cb in build_task_callbacks():
+        app.add_handler(cb)
+
+    # Habit tracker
+    app.add_handler(build_habit_conversation())
+    for cb in build_habit_callbacks():
         app.add_handler(cb)
 
     # ── Bot commands ──────────────────────────────────────────────────────────
