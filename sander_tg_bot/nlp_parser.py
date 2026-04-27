@@ -6,7 +6,7 @@ Attempts Groq-powered NLP extraction first; falls back to regex heuristics.
 Output schema:
   {
     "title":    str,           # cleaned task name
-    "deadline": str | None,    # UTC ISO "YYYY-MM-DDTHH:MM:SS" or None
+    "deadline": str | None,    # UTC ISO "YYYY-MM-DDTHH:MM:SS" or date-only "YYYY-MM-DD"
     "priority": "high"|"medium"|"low"
   }
 """
@@ -216,21 +216,44 @@ def _regex_parse(text: str, user_tz: str) -> dict:
 
 # ── Display helpers (used by tasks.py) ────────────────────────────────────────
 
-def format_deadline_local(deadline_utc: str, user_tz: str) -> str:
-    """Return human-readable deadline in user's timezone."""
+def format_deadline_local(deadline_str: str, user_tz: str) -> str:
+    """
+    Return human-readable deadline in user's timezone.
+
+    FIX: When deadline_str has no 'T' (date-only, e.g. '2026-04-23'), display
+    just the date without any timezone conversion. Previously, a date-only string
+    was treated as midnight UTC and converted to local time — showing wrong hours
+    (e.g. 05:00 for UTC+5 users when no specific time was set).
+    """
     try:
+        if "T" not in deadline_str:
+            # Date-only: parse and format without timezone conversion
+            dt = datetime.strptime(deadline_str[:10], "%Y-%m-%d")
+            return dt.strftime("%d.%m.%Y")
+        # Has explicit time: convert from UTC to user's timezone
         tz   = pytz.timezone(user_tz)
-        dt   = datetime.fromisoformat(deadline_utc).replace(tzinfo=pytz.utc)
+        dt   = datetime.fromisoformat(deadline_str).replace(tzinfo=pytz.utc)
         dt_l = dt.astimezone(tz)
         return dt_l.strftime("%d.%m.%Y %H:%M")
     except Exception:
-        return deadline_utc
+        return deadline_str
 
 
-def time_until(deadline_utc: str) -> str:
-    """Return human-readable time remaining."""
+def time_until(deadline_str: str) -> str:
+    """
+    Return human-readable time remaining.
+
+    FIX: Date-only strings (no 'T') are treated as end-of-day (23:59:59 UTC)
+    to avoid false "overdue" for tasks due today when no time was specified.
+    """
     try:
-        dt  = datetime.fromisoformat(deadline_utc).replace(tzinfo=pytz.utc)
+        if "T" not in deadline_str:
+            # Date-only: treat as end of that calendar day in UTC
+            dt = datetime.strptime(deadline_str[:10], "%Y-%m-%d")
+            dt = dt.replace(hour=23, minute=59, second=59, tzinfo=pytz.utc)
+        else:
+            dt = datetime.fromisoformat(deadline_str).replace(tzinfo=pytz.utc)
+
         now = datetime.now(pytz.utc)
         if dt <= now:
             return "⚠️ overdue"
