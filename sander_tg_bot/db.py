@@ -195,6 +195,7 @@ def add_task(
     priority: str = "medium",
     deadline_utc: Optional[str] = None,
     status: str = "todo",
+    user_tz: str = "Asia/Almaty",
 ) -> int:
     web_uid = _get_user_id(user_id)
     if not web_uid:
@@ -203,18 +204,26 @@ def add_task(
         )
 
     due_date = None
+    due_time = None
     if deadline_utc:
         try:
-            # BUG FIX: store only the date portion in due_date to match the DB column type
-            due_date = datetime.fromisoformat(deadline_utc).date()
+            import pytz
+            dt_utc = datetime.fromisoformat(deadline_utc).replace(tzinfo=timezone.utc)
+            tz = pytz.timezone(user_tz)
+            dt_local = dt_utc.astimezone(tz)
+            due_date = dt_local.date()
+            # Сохраняем время в локальном часовом поясе (как это делает сайт),
+            # только если в deadline_utc была временна́я составляющая
+            if "T" in deadline_utc:
+                due_time = dt_local.strftime("%H:%M")
         except ValueError:
             logger.warning("Invalid deadline_utc format: %s", deadline_utc)
 
     completed = status == "done"
     row = _exec("""
-        INSERT INTO tasks (user_id, title, due_date, priority, completed, status, archived, created_at)
-        VALUES (%s, %s, %s, %s, %s, %s, FALSE, NOW()) RETURNING id
-    """, (web_uid, text, due_date, priority, completed, status))
+        INSERT INTO tasks (user_id, title, due_date, due_time, priority, completed, status, archived, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, FALSE, NOW()) RETURNING id
+    """, (web_uid, text, due_date, due_time, priority, completed, status))
     return row["id"] if row else 0
 
 
