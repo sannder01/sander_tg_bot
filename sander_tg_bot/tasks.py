@@ -773,11 +773,13 @@ async def fsm_select_priority(update: Update, context: ContextTypes.DEFAULT_TYPE
     parsed["priority"] = priority
 
     try:
+        tz_str = db.get_tz(uid)
         task_id = db.add_task(
             user_id      = uid,
             text         = parsed["title"],
             priority     = priority,
             deadline_utc = parsed.get("deadline"),
+            user_tz      = tz_str,
         )
         await query.answer(f"✅ Task #{task_id} created!", show_alert=False)
     except ValueError as e:
