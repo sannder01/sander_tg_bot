@@ -220,21 +220,21 @@ def format_deadline_local(deadline_str: str, user_tz: str) -> str:
     """
     Return human-readable deadline in user's timezone.
 
-    FIX: When deadline_str has no 'T' (date-only, e.g. '2026-04-23'), display
-    just the date without any timezone conversion. Previously, a date-only string
-    was treated as midnight UTC and converted to local time — showing wrong hours
-    (e.g. 05:00 for UTC+5 users when no specific time was set).
+    «due_time» в БД всегда хранится в локальном времени пользователя:
+    - сайт сохраняет due_time напрямую из формы (локальное время)
+    - бот теперь тоже конвертирует deadline_utc → local перед сохранением
+
+    Поэтому строки с 'T' (дата + время) выводим КАК ЕСТЬ, без UTC→local
+    конвертации. Строки без 'T' (только дата) выводим как дату.
     """
     try:
         if "T" not in deadline_str:
-            # Date-only: parse and format without timezone conversion
+            # Только дата — форматируем без конвертации
             dt = datetime.strptime(deadline_str[:10], "%Y-%m-%d")
             return dt.strftime("%d.%m.%Y")
-        # Has explicit time: convert from UTC to user's timezone
-        tz   = pytz.timezone(user_tz)
-        dt   = datetime.fromisoformat(deadline_str).replace(tzinfo=pytz.utc)
-        dt_l = dt.astimezone(tz)
-        return dt_l.strftime("%d.%m.%Y %H:%M")
+        # Дата + время — уже в локальном часовом поясе пользователя
+        dt = datetime.strptime(deadline_str[:16], "%Y-%m-%dT%H:%M")
+        return dt.strftime("%d.%m.%Y %H:%M")
     except Exception:
         return deadline_str
 
