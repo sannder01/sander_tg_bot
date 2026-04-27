@@ -67,7 +67,16 @@ def _task_text(t: dict) -> str:
 
 
 def _task_deadline(t: dict) -> Optional[str]:
-    """Return the deadline/due_date as a string, normalising field names."""
+    """
+    Return the deadline/due_date as a string, normalising field names.
+
+    FIX: When there is no due_time, return a date-only string ("YYYY-MM-DD")
+    instead of "YYYY-MM-DDT00:00:00". The old behaviour treated midnight UTC
+    as the deadline time, causing format_deadline_local() to display wrong
+    hours after timezone conversion (e.g. 05:00 for UTC+5 users).
+    format_deadline_local() and time_until() in nlp_parser.py now handle
+    both date-only and datetime strings correctly.
+    """
     raw = t.get("deadline") or t.get("due_date")
     if raw is None:
         return None
@@ -78,7 +87,8 @@ def _task_deadline(t: dict) -> Optional[str]:
         date_str = str(raw)[:10]  # берём только дату "2026-04-23"
     if due_time:
         return f"{date_str}T{due_time}:00"  # "2026-04-23T18:30:00"
-    return f"{date_str}T00:00:00"
+    # No explicit time → return date-only; display helpers handle this correctly
+    return date_str  # "2026-04-23"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  UI BUILDERS
