@@ -133,9 +133,15 @@ def _escape_md(text: str) -> str:
 
 
 def _parse_course(component) -> str:
-    cats = str(component.get("CATEGORIES", ""))
-    if cats and cats not in ("None", ""):
-        return cats.strip()
+    cats_raw = component.get("CATEGORIES")
+    if cats_raw is not None:
+        # vCategory from icalendar is list-like — join items to get clean string
+        try:
+            cats = ", ".join(str(c) for c in cats_raw)
+        except TypeError:
+            cats = str(cats_raw)
+        if cats and cats not in ("None", ""):
+            return cats.strip()
     desc  = str(component.get("DESCRIPTION", ""))
     match = re.search(r"Course[:\s]+(.+)", desc, re.IGNORECASE)
     if match:
