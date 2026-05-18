@@ -121,6 +121,10 @@ def link_telegram(tg_user_id: str, email: str) -> Optional[str]:
     if not rows:
         return None
     user_id = rows[0]["id"]
+    # Удаляем старую привязку этого Telegram-пользователя (если была),
+    # иначе ON CONFLICT (user_id) не сработает при смене email —
+    # старая строка с этим chat_id просто остаётся в таблице.
+    _exec("DELETE FROM tg_connections WHERE chat_id = %s", (tg_user_id,))
     _exec("""
         INSERT INTO tg_connections (user_id, chat_id, created_at, updated_at)
         VALUES (%s, %s, NOW(), NOW())
