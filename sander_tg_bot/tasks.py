@@ -19,6 +19,7 @@ FSM States (ConversationHandler):
 
 import calendar as cal_mod
 import logging
+from html import escape
 from datetime import datetime, timedelta, date
 from typing import Optional
 
@@ -97,7 +98,7 @@ def _task_deadline(t: dict) -> Optional[str]:
 def _task_line(t: dict, idx: int, user_tz: str) -> str:
     si    = STATUS_ICON.get(t.get("status", "todo"), "🔲")
     pi    = PRIORITY_ICON.get(t.get("priority", "medium"), "🟡")
-    title = _task_text(t)
+    title = escape(_task_text(t))
     if t.get("status") == "done":
         title = f"<s>{title}</s>"
     else:
@@ -198,7 +199,7 @@ def _build_detail_text(t: dict, user_tz: str) -> str:
     lines = [
         f"⚡️ <b>TASK #{t['id']}</b>",
         DIVIDER,
-        f"  📌 <b>{_task_text(t)}</b>",
+        f"  📌 <b>{escape(_task_text(t))}</b>",
         "",
         f"  {pi}  Priority: <b>{pl}</b>",
         f"  {si}  Status:   <b>{sl}</b>",
@@ -331,7 +332,7 @@ def _build_day_text(date_str: str, tasks: list, user_tz: str) -> str:
         pi = PRIORITY_ICON.get(t.get("priority", "medium"), "🟡")
         dl = _task_deadline(t)
         dl_str = format_deadline_local(dl, user_tz) if dl else ""
-        lines.append(f"  {pi} {si} <b>{_task_text(t)}</b>\n      <code>{dl_str}</code>")
+        lines.append(f"  {pi} {si} <b>{escape(_task_text(t))}</b>\n      <code>{escape(dl_str)}</code>")
 
     lines.append(DIVIDER)
     return "\n".join(lines)
@@ -405,7 +406,7 @@ def _build_archive_text(tasks: list, page: int) -> str:
     for t in tasks[start:end]:
         pi        = PRIORITY_ICON.get(t.get("priority", "medium"), "🟡")
         completed = str(t.get("completed_at") or "")[:10]
-        lines.append(f"  {pi} ✅ <s>{_task_text(t)}</s>  <code>{completed}</code>")
+        lines.append(f"  {pi} ✅ <s>{escape(_task_text(t))}</s>  <code>{escape(completed)}</code>")
 
     footer = f"\n{DIVIDER}\n📄 Page <code>{page + 1}/{total_pages}</code>"
     return header + "\n".join(lines) + footer
@@ -738,7 +739,7 @@ async def fsm_receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     preview = (
         f"⚡️ <b>TASK PREVIEW</b>\n{DIVIDER}\n\n"
-        f"  📌 <b>{parsed['title']}</b>\n"
+        f"  📌 <b>{escape(parsed['title'])}</b>\n"
         f"{dl_display}\n"
         f"  {pi}  Priority: <b>{pl}</b>\n\n"
         f"{DIVIDER}\n"
@@ -837,7 +838,7 @@ async def reminder_check_job(context: ContextTypes.DEFAULT_TYPE):
             msg   = (
                 f"{emoji} <b>DEADLINE REMINDER</b>\n"
                 f"{DIVIDER}\n\n"
-                f"  {pi} <b>{title}</b>\n\n"
+                f"  {pi} <b>{escape(title)}</b>\n\n"
                 f"  ⏱ Due in <b>{label}</b>!\n"
                 f"  📅 <code>{dl[:10]}</code>\n\n"
                 f"{DIVIDER}\n"
@@ -904,7 +905,7 @@ async def daily_briefing_job(context: ContextTypes.DEFAULT_TYPE):
                 lines.append(f"\n⚠️ <b>OVERDUE ({len(overdue)}):</b>")
                 for t in overdue[:5]:
                     pi = PRIORITY_ICON.get(t.get("priority", "medium"), "🟡")
-                    lines.append(f"  {pi} <s>{_task_text(t)[:40]}</s>")
+                    lines.append(f"  {pi} <s>{escape(_task_text(t)[:40])}</s>")
 
             if today_tasks:
                 lines.append(f"\n📅 <b>DUE TODAY ({len(today_tasks)}):</b>")
@@ -913,7 +914,7 @@ async def daily_briefing_job(context: ContextTypes.DEFAULT_TYPE):
                     si      = STATUS_ICON.get(t.get("status", "todo"), "🔲")
                     due_str = str(t.get("due_date", ""))
                     lines.append(
-                        f"  {pi} {si} <b>{_task_text(t)[:35]}</b>  <code>{due_str[-5:]}</code>"
+                        f"  {pi} {si} <b>{escape(_task_text(t)[:35])}</b>  <code>{escape(due_str[-5:])}</code>"
                     )
 
             lines.append(f"\n🔲 <b>Active tasks:</b> <code>{len(active)}</code>")

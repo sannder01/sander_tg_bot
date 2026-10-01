@@ -20,6 +20,7 @@ Callback prefixes:
 
 import json
 import logging
+from html import escape
 from datetime import date, datetime
 from typing import Optional, List
 
@@ -210,7 +211,7 @@ def _build_text(habits: List[dict]) -> str:
         streak_txt = f"  🔥<code>{streak}</code>" if streak > 0 else ''
         sub = _schedule_label(h)
         dim = '' if scheduled else ' <i>(не сегодня)</i>'
-        lines.append(f"  {check} <b>{h['name']}</b>{streak_txt}{dim}\n      {sub}")
+        lines.append(f"  {check} <b>{escape(h['name'])}</b>{streak_txt}{dim}\n      {sub}")
 
     done_count = sum(1 for h in habits if h.get('done_today'))
     today_count = sum(1 for h in habits if _today_weekday() in _parse_days(h))
@@ -377,7 +378,7 @@ async def fsm_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("❌ Отмена", callback_data="hb_cnl")],
     ])
     await update.message.reply_text(
-        f"✅ Название: <b>{name}</b>\n\n  Выберите расписание:",
+        f"✅ Название: <b>{escape(name)}</b>\n\n  Выберите расписание:",
         parse_mode="HTML", reply_markup=kb,
     )
     return HB_WAIT_FREQ
@@ -408,7 +409,7 @@ async def fsm_freq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['hb_days'] = list(range(5))  # default: weekdays
     name = context.user_data.get('hb_name', '?')
     await q.edit_message_text(
-        f"✅ Название: <b>{name}</b>\n\n"
+        f"✅ Название: <b>{escape(name)}</b>\n\n"
         f"  Выберите дни:\n"
         f"  <i>Выбрано: {_days_summary(context.user_data['hb_days'])}</i>",
         parse_mode="HTML",
@@ -439,7 +440,7 @@ async def fsm_day_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['hb_days'] = days
     name = context.user_data.get('hb_name', '?')
     await q.edit_message_text(
-        f"✅ Название: <b>{name}</b>\n\n"
+        f"✅ Название: <b>{escape(name)}</b>\n\n"
         f"  Выберите дни:\n"
         f"  <i>Выбрано: {_days_summary(days)}</i>",
         parse_mode="HTML",

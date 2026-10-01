@@ -1,5 +1,5 @@
-# ⚡️ Chronicle Engine v3.0
-> A high-end Telegram Task Management System with Flow-state UX
+# ✨ Chronicle Telegram Bot
+Task manager, habit tracker, calendar, reminders, and optional AI helpers.
 
 ---
 
@@ -9,39 +9,11 @@
 chronicle/
 ├── bot.py           — Main entry point, command handlers, scheduler setup
 ├── tasks.py         — Complete Task Manager (FSM, UI, callbacks)
-├── db.py            — SQLite persistence layer (tasks + user settings)
+├── db.py            — PostgreSQL persistence layer shared with the website
 ├── nlp_parser.py    — Smart NLP task parsing via Groq + regex fallback
 ├── requirements.txt — Dependencies
 └── README.md        — This file
 ```
-
----
-
-## 🗃 Database Schema
-
-### `tasks`
-| Column | Type | Description |
-|--------|------|-------------|
-| `id` | INTEGER PK | Auto-increment |
-| `user_id` | TEXT | Telegram user ID |
-| `text` | TEXT | Task description |
-| `status` | TEXT | `todo` / `in_progress` / `done` |
-| `priority` | TEXT | `high` / `medium` / `low` |
-| `deadline` | TEXT | UTC ISO `YYYY-MM-DDTHH:MM:SS` or NULL |
-| `created_at` | TEXT | UTC ISO creation time |
-| `completed_at` | TEXT | UTC ISO completion time (or NULL) |
-| `archived` | INTEGER | `0` = active, `1` = archived |
-| `reminder_24h` | INTEGER | `1` = 24h reminder already sent |
-| `reminder_1h` | INTEGER | `1` = 1h reminder already sent |
-| `reminder_15m` | INTEGER | `1` = 15m reminder already sent |
-
-### `user_settings`
-| Column | Type | Default | Description |
-|--------|------|---------|-------------|
-| `user_id` | TEXT PK | — | Telegram user ID |
-| `timezone` | TEXT | `Asia/Almaty` | pytz timezone string |
-| `briefing_hour` | INTEGER | `9` | Local hour for morning briefing |
-| `briefing_enabled` | INTEGER | `1` | `1` = enabled |
 
 ---
 
@@ -83,7 +55,7 @@ chronicle/
 
 ## ⚙️ Environment Variables
 
-Create a `.env` file:
+Copy `.env.example` to `.env` and fill in the values. Keep `.env` private; never commit tokens, calendar links, or database credentials.
 
 ```env
 TELEGRAM_BOT_TOKEN=your_bot_token_here
@@ -100,9 +72,11 @@ DAYS_AHEAD=7
 # AI auto-reply persona
 BOT_PERSONA=Ты отвечаешь вместо владельца. Отвечай кратко.
 
-# Database path (default: tasks.db in project root)
-TASKS_DB=tasks.db
+# Shared PostgreSQL database used by the website
+DATABASE_URL=postgresql://user:password@host:5432/database
 ```
+
+`ICAL_URL` is optional. Set it only to a calendar URL you control; users can also add a personal calendar with `/add_deadline`.
 
 ---
 
@@ -154,13 +128,6 @@ The bot uses **Groq (Llama 3)** to extract:
 - 🔴 Priority level (inferred from urgency words)
 
 Falls back to **regex heuristics** if Groq is unavailable.
-
----
-
-## 📦 Migration
-
-On first run, the bot automatically migrates tasks from the old `tasks.json`
-format into the new SQLite database, then renames the JSON file to `tasks.json.migrated`.
 
 ---
 
