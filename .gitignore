@@ -1,0 +1,16 @@
+# Secrets and local state
+.env
+.env.*
+!.env.example
+*.db
+*.sqlite
+*.sqlite3
+bot.lock
+
+# Python generated files
+__pycache__/
+*.py[cod]
+
+# Local tooling
+.venv/
+venv/

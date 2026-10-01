@@ -14,6 +14,7 @@ import os
 import re
 import sys
 import logging
+from html import escape
 import pytz
 from datetime import datetime, timedelta, timezone
 from urllib.request import urlopen, Request
@@ -72,12 +73,7 @@ _persona = {
 }
 
 # ─── AITU Deadline config ──────────────────────────────────────────────────────
-ICAL_URL = os.getenv(
-    "ICAL_URL",
-    "https://lms.astanait.edu.kz/calendar/export_execute.php"
-    "?userid=17634&authtoken=3f6f62339ece52c531c9dbffe568d0eacd33444f"
-    "&preset_what=courses&preset_time=recentupcoming",
-)
+ICAL_URL = os.getenv("ICAL_URL", "").strip()
 DEADLINE_CHAT_ID = os.getenv("DEADLINE_CHAT_ID", "")
 DEADLINE_HOUR    = int(os.getenv("DEADLINE_HOUR",   "8"))
 DEADLINE_MINUTE  = int(os.getenv("DEADLINE_MINUTE", "0"))
@@ -463,27 +459,26 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ai_status = "✅ Groq (Llama 3)" if groq_client else "❌ No GROQ_API_KEY"
+    ai_status = "✅ доступен" if groq_client else "⚪️ AI не настроен"
     await update.message.reply_text(
-        "⚡️ <b>CHRONICLE ENGINE</b>  <code>v3.0</code>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"  🤖  AI Engine:  {ai_status}\n\n"
-        "  <b>Modules:</b>\n"
-        "  🔹  /tasks      — <i>Task Manager</i>\n"
-        "         ↳ NLP add · Calendar · Analytics\n"
-        "         ↳ Reminders · Archive\n"
-        "  🔹  /deadlines    — <i>Your calendar deadlines</i>\n"
-        "  🔹  /add_deadline — <i>Link your iCal calendar</i>\n"
-        "  🔹  /ai         — <i>AI Assistant</i>\n"
-        "  🔹  /tz         — <i>Set your timezone</i>\n"
-        "  🔹  /briefing   — <i>Toggle morning briefing</i>\n"
-        "  🔹  /persona    — <i>Set AI auto-reply style</i>\n"
-        "  🔹  /status     — <i>System status</i>\n"
-        "  🔹  /reset      — <i>Reset AI history</i>\n"
-        "  🔹  /link       — <i>Link a website account: https://schronicle.vercel.app</i>\n\n"
-        "  🔹  /habits      — <i>habits</i>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "  Start with /tasks to manage your day.",
+        "✨ <b>Chronicle</b> <i>твой спокойный центр дел</i>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🤖 AI: {ai_status}\n\n"
+        "<b>Планируй</b>\n"
+        "📝 /tasks — задачи, календарь и статистика\n"
+        "🔥 /habits — привычки и серии\n"
+        "📅 /deadlines — ближайшие дедлайны\n"
+        "🔗 /add_deadline — подключить календарь\n\n"
+        "<b>Настрой</b>\n"
+        "🌍 /tz — часовой пояс\n"
+        "☀️ /briefing — утренний обзор\n"
+        "🔐 /link — связать аккаунт с сайтом\n\n"
+        "<b>Помощники</b>\n"
+        "💬 /ai <i>вопрос</i> — спросить AI\n"
+        "🧹 /reset — очистить историю AI\n"
+        "📊 /status — состояние бота\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Начни с /tasks — добавь первое дело ✨",
         parse_mode="HTML",
     )
 
@@ -503,7 +498,7 @@ async def cmd_set_tz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pytz.timezone(tz_name)  # validate
     except pytz.exceptions.UnknownTimeZoneError:
         return await update.message.reply_text(
-            f"❌ Unknown timezone: <code>{tz_name}</code>\n"
+            f"❌ Unknown timezone: <code>{escape(tz_name)}</code>\n"
             "See: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones",
             parse_mode="HTML",
         )
@@ -603,7 +598,7 @@ async def cmd_persona(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     _persona["prompt"] = " ".join(context.args)
     await update.message.reply_text(
-        f"✅ Persona updated:\n\n<i>{_persona['prompt']}</i>", parse_mode="HTML"
+        f"✅ Persona updated:\n\n<i>{escape(_persona['prompt'])}</i>", parse_mode="HTML"
     )
 
 
